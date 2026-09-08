@@ -1,0 +1,43 @@
+# Build output. This also contains raylib and raygui, which CMake fetches on
+# the first build - several hundred MB that must never be committed.
+build/
+out/
+
+# Compiled artifacts, in case anyone configures a build in the source tree
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+
+# CMake leftovers from an accidental in-source configure
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+install_manifest.txt
+
+# Visual Studio / VS Code local state. Delete the .vscode line if you ever
+# want to share debugger or task configuration with others.
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Editor scratch files
+*.swp
+*~
+.idea/
+
+# OS clutter
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# Local environment or secrets, should any ever appear
+.env
+*.local
