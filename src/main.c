@@ -1,8 +1,38 @@
 #include "raylib.h"
 #include "webcam.h"
 
+#include <math.h>
+
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
+
+#define TAU 6.2831853f
+
+// Smooth pseudo-random drift in roughly -1..1. Two sine waves at unrelated
+// frequencies read as wandering rather than as an obvious oscillation, and
+// unlike interpolating between random waypoints there is no momentary stop at
+// each target. Random phases are drawn once at startup so each run differs.
+typedef struct Drift {
+    float freqA;
+    float freqB;
+    float phaseA;
+    float phaseB;
+} Drift;
+
+static Drift MakeDrift(float hzA, float hzB)
+{
+    Drift d;
+    d.freqA = hzA*TAU;
+    d.freqB = hzB*TAU;
+    d.phaseA = (float)GetRandomValue(0, 6283)/1000.0f;
+    d.phaseB = (float)GetRandomValue(0, 6283)/1000.0f;
+    return d;
+}
+
+static float DriftValue(Drift d, float t)
+{
+    return 0.62f*sinf(t*d.freqA + d.phaseA) + 0.38f*sinf(t*d.freqB + d.phaseB);
+}
 
 typedef struct RelightShader {
     Shader shader;
@@ -147,7 +177,7 @@ int main(int argc, char **argv)
     const char *photoPath = (argc > 1) ? argv[1] : ASSET_DIR "/portrait.png";
 
     const float baseWidth = 1240.0f;
-    const float baseHeight = 800.0f;
+    const float baseHeight = 860.0f;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow((int)baseWidth, (int)baseHeight, "normalish");
@@ -237,6 +267,17 @@ int main(int argc, char **argv)
     float lightU = 0.5f;
     float lightV = 0.5f;
 
+    // Demo mode drives the light on its own, for showing the effect off
+    // without holding the mouse. Deliberately drifts at unrelated rates per
+    // axis, so the path wanders instead of tracing a diagonal.
+    bool demoEnabled = false;
+    int demoMode = 0;               // 0 = basic (position only), 1 = full
+    float demoTime = 0.0f;
+    Drift driftU = MakeDrift(0.043f, 0.101f);
+    Drift driftV = MakeDrift(0.061f, 0.079f);
+    Drift driftHeight = MakeDrift(0.037f, 0.071f);
+    Drift driftHue = MakeDrift(0.023f, 0.053f);
+
     while (!WindowShouldClose())
     {
         if (IsKeyPressed(KEY_R))
@@ -274,7 +315,7 @@ int main(int argc, char **argv)
         Vector2 mouse = GetMousePosition();
         if (CheckCollisionPointRec(mouse, quad))
         {
-            if (!followBrightest)
+            if (!followBrightest && !demoEnabled)
             {
                 lightU = (mouse.x - quad.x)/quad.width;
                 lightV = (mouse.y - quad.y)/quad.height;
@@ -284,7 +325,7 @@ int main(int argc, char **argv)
             if (light.height > 1.5f) light.height = 1.5f;
         }
 
-        if (followBrightest && tracking)
+        if (followBrightest && tracking && !demoEnabled)
         {
             float u = trackedPoint.x/(float)GetWebcamWidth();
             float v = trackedPoint.y/(float)GetWebcamHeight();
@@ -299,14 +340,40 @@ int main(int argc, char **argv)
             lightV = smoothedV;
         }
 
+        // The user's slider values are left untouched by the demo, so turning
+        // it off restores whatever was set by hand.
+        float activeHeight = light.height;
+        Color activeColor = light.color;
+
+        demoTime += GetFrameTime();
+        if (demoEnabled)
+        {
+            lightU = 0.5f + 0.40f*DriftValue(driftU, demoTime);
+            lightV = 0.5f + 0.40f*DriftValue(driftV, demoTime);
+
+            if (demoMode == 1)
+            {
+                // Kept low and capped at 0.25: a light close to the surface
+                // rakes across the relief and is far more dramatic than a
+                // high one, which flattens everything out.
+                activeHeight = 0.135f + 0.115f*DriftValue(driftHeight, demoTime);
+
+                // Hue drifts steadily and wraps, which stays visually
+                // continuous because the hue wheel joins up at 360.
+                float hue = fmodf(demoTime*7.0f + 70.0f*DriftValue(driftHue, demoTime), 360.0f);
+                if (hue < 0.0f) hue += 360.0f;
+                activeColor = ColorFromHSV(hue, 0.45f, 1.0f);
+            }
+        }
+
         // The shader lights in texture space. A mirrored feed reverses left and
         // right relative to what is on screen, so flip x on the way in.
         bool mirroredSource = (sourceMode == 1) && mirrorWebcam;
         float surfaceX = lightU*aspect;
         if (mirroredSource) surfaceX = aspect - surfaceX;
 
-        float lightPos[3] = { surfaceX, lightV, light.height };
-        Vector4 colorNormalized = ColorNormalize(light.color);
+        float lightPos[3] = { surfaceX, lightV, activeHeight };
+        Vector4 colorNormalized = ColorNormalize(activeColor);
         float lightColor[3] = { colorNormalized.x, colorNormalized.y, colorNormalized.z };
         float texelSize[2] = { 1.0f/albedoTexture.width, 1.0f/albedoTexture.height };
 
@@ -362,6 +429,17 @@ int main(int argc, char **argv)
         else GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "photo (no webcam)");
         y += groupStep;
 
+        // Full demo drives height and colour itself, so those controls become
+        // live read-outs rather than inputs while it runs.
+        bool demoDrivesLook = demoEnabled && (demoMode == 1);
+
+        GuiCheckBox((Rectangle){ labelX, y, 18.0f*uiScale, 18.0f*uiScale }, "Demo", &demoEnabled);
+        if (!demoEnabled) GuiSetState(STATE_DISABLED);
+        GuiToggleGroup((Rectangle){ labelX + 100.0f*uiScale, y - 2.0f*uiScale, 95.0f*uiScale, 22.0f*uiScale },
+                       "Basic;Full", &demoMode);
+        GuiSetState(STATE_NORMAL);
+        y += 30.0f*uiScale;
+
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Intensity",
                      TextFormat("%.2f", light.intensity), &light.intensity, 0.0f, 6.0f);
         y += rowStep;
@@ -377,8 +455,12 @@ int main(int argc, char **argv)
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Shininess",
                      TextFormat("%.0f", light.shininess), &light.shininess, 1.0f, 200.0f);
         y += rowStep;
+        float shownHeight = activeHeight;
+        if (demoDrivesLook) GuiSetState(STATE_DISABLED);
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Height",
-                     TextFormat("%.2f", light.height), &light.height, 0.02f, 1.5f);
+                     TextFormat("%.2f", shownHeight),
+                     demoDrivesLook ? &shownHeight : &light.height, 0.02f, 1.5f);
+        GuiSetState(STATE_NORMAL);
         y += groupStep;
 
         GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Derived relief");
@@ -391,8 +473,17 @@ int main(int argc, char **argv)
         y += groupStep;
 
         GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Light colour");
+        // A live swatch, because raygui greys the picker out while the demo
+        // drives it and the disabled styling hides the actual colour.
+        Rectangle swatch = { labelX + labelW - 22.0f*uiScale, y, 18.0f*uiScale, 18.0f*uiScale };
+        DrawRectangleRec(swatch, activeColor);
+        DrawRectangleLinesEx(swatch, uiScale, (Color){ 90, 90, 100, 255 });
         y += labelStep;
-        GuiColorPicker((Rectangle){ labelX, y, 120.0f*uiScale, 120.0f*uiScale }, NULL, &light.color);
+        Color shownColor = activeColor;
+        if (demoDrivesLook) GuiSetState(STATE_DISABLED);
+        GuiColorPicker((Rectangle){ labelX, y, 120.0f*uiScale, 120.0f*uiScale }, NULL,
+                       demoDrivesLook ? &shownColor : &light.color);
+        GuiSetState(STATE_NORMAL);
         y += 132.0f*uiScale;
 
         if (webcamSystemReady && (GetWebcamDeviceCount() > 0))
