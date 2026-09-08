@@ -244,7 +244,9 @@ int main(int argc, char **argv)
     // virtual like OBS - so the device is selectable rather than assumed.
     char deviceListText[512] = { 0 };
     int selectedDevice = 0;
-    int selectedMode = 0;          // index into captureWidths/captureHeights
+    // 720p, not 480p: 640x480 is 4:3, and asking for it makes a 16:9 camera
+    // hand back its one 4:3 mode, which then gets letterboxed downstream.
+    int selectedMode = 1;          // index into captureWidths/captureHeights
     int openedDevice = -1;
     int openedMode = -1;
     bool deviceDropdownOpen = false;
