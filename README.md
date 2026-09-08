@@ -166,6 +166,47 @@ rough proxy for depth. Hard side light bakes a direction into the derived
 highlights become permanent fake bumps; and glasses are the worst offender
 because lens reflections read as raised blobs.
 
+## Virtual camera
+
+[src/vcam/](src/vcam/) is a Media Foundation media source DLL that exposes
+"normalish camera" as a real camera device, so any application - Teams,
+Zoom, a browser - can select it. It is the one part of the project that is
+C++ rather than C: implementing a COM server in plain C means hand-rolling
+vtables, reference counting and QueryInterface.
+
+**It is adopted from [smourier/VCamSample](https://github.com/smourier/VCamSample)
+by Simon Mourier, MIT licensed** - see
+[src/vcam/LICENSE-VCamSample.txt](src/vcam/LICENSE-VCamSample.txt). A
+from-scratch implementation reached the point where the camera appeared,
+could be selected and negotiated a format, but never produced frames, and
+eight rounds of comparing against that working source did not close the gap.
+[PLAN.md](PLAN.md) records the whole attempt and why adopting was the better
+call. Changed from the original: our CLSID, the packaged-app identity lookup
+removed (normalish is unpackaged, and it was the only thing needing a
+generated C++/WinRT projection header), and the build moved to CMake.
+
+Registration needs one elevated step, because the DLL is loaded by the
+Camera Frame Server service and by consuming applications, none of which
+read a per-user registry hive:
+
+```powershell
+regsvr32 C:\ProgramData\normalish\normalish_vcam.dll      # elevated
+regsvr32 /u C:\ProgramData\normalish\normalish_vcam.dll   # to undo
+```
+
+No camera appears in anyone's list until normalish is running with the
+toggle on: the camera is created with `MFVirtualCameraLifetime_Session`, so
+it exists only while the owning process holds it.
+
+**If you change the DLL, restart the Frame Server service.** It caches a
+device's configuration per CLSID, and will keep serving the old media types
+and behaviour indefinitely - which makes code changes look like they had no
+effect at all:
+
+```powershell
+Restart-Service FrameServer -Force    # elevated
+```
+
 ## Assets and credits
 
 `assets/portrait.png` is a photo by

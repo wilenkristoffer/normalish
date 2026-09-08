@@ -384,6 +384,404 @@ Design decisions worth keeping:
   hue wheel joins up at 360 and wrapping is visually continuous.
 - Base window height went from 800 to 860 to fit the extra row.
 
+## Virtual camera: expose normalish as a camera source
+
+Goal: a "normalish camera" that Teams (or anything else) can select, showing
+the relit webcam feed, behind a default-off "Expose as virtual webcam"
+toggle. The alternative - OBS with a virtual camera pointed at our window -
+works today but is a hassle, and was deliberately rejected in favour of
+doing the real thing.
+
+Approach: `MFCreateVirtualCamera` (Windows 11 build 22000+, and this machine
+is 26200). Not DirectShow: the new Teams is Chromium-based and Chromium on
+Windows captures through Media Foundation, so a DirectShow-only camera would
+most likely never appear in the list. That is what broke many older virtual
+cameras.
+
+Language exception: implementing a COM server in plain C means hand-rolling
+vtable structs, refcounting and QueryInterface. The media source DLL is
+therefore C++, while normalish itself stays C. Agreed 2026-09-08 as specific
+to this DLL.
+
+### Spike findings (measured, not assumed)
+
+A throwaway probe answered the risky questions before any COM was written:
+
+- `MFIsVirtualCameraTypeSupported(SoftwareCameraSource)` returns
+  **supported = 1** here, so the whole approach is viable.
+- `MFCreateVirtualCamera` returns **S_OK even for a CLSID that is not
+  registered at all**. Creation validates nothing.
+- `IMFVirtualCamera::Start` is where the CLSID is actually resolved, and it
+  returns **`REGDB_E_CLASSNOTREG` (0x80040154)** when it cannot be found.
+  That makes `Start` a precise test oracle: it can distinguish "registration
+  not visible" from "media source is wrong" without a working camera.
+- Pointing the CLSID at an arbitrary DLL registered under
+  **`HKCU\Software\Classes\CLSID\...\InprocServer32`** changed the `Start`
+  result to **`E_NOINTERFACE` (0x80004002)**. The error changing at all
+  proves the per-user registration was found.
+
+**That led to a wrong conclusion, corrected below.** From the error moving on
+it was inferred that HKCU registration is sufficient and no elevation is
+needed. It is not. HKCU is enough for the in-process activation that `Start`
+performs *first*, which is exactly why the error advanced and looked like
+progress. `Start` then goes on to publish the camera for other processes,
+and that later stage is what fails. The lesson: an error code changing means
+the *first* obstacle moved, not that the goal is reachable.
+
+### Second round of findings: building the DLL
+
+The media source DLL (`src/vcam/vcam.cpp`, C++ with WRL) compiles and its
+CLSID now resolves - `Start` no longer returns `REGDB_E_CLASSNOTREG`, which
+confirms **HKCU registration is enough and no elevation is needed**.
+
+Three things cost time and are worth writing down:
+
+- **`IKsControl` comes from `ksproxy.h`, not `ks.h`.** ks.h declares it only
+  behind a guard that a normal user-mode build does not satisfy. Confirmed
+  by compiling each combination in isolation rather than guessing: windows +
+  unknwn + ks fails, adding ksproxy succeeds.
+- **WRL only answers QueryInterface for IIDs listed explicitly.** Declaring
+  `IMFMediaSourceEx` alone means QI for its bases `IMFMediaSource` and
+  `IMFMediaEventGenerator` fails with `E_NOINTERFACE`. The fix is
+  `ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>`,
+  and likewise for the stream.
+- **The registered CLSID must be an activation object, not the media
+  source.** This was the real architectural mistake. Media Foundation asks
+  the class factory for **`IMFActivate`**
+  (`{7FEE9E9A-4A89-47A6-899C-B6A53A70FB67}`) and then calls
+  `ActivateObject()` to obtain the media source - the same pattern
+  `MFEnumDeviceSources` returns for real cameras. It also explains the
+  documented requirement that `GetSourceAttributes` return the same
+  attributes as the IMFActivate.
+
+That last one was found by **instrumenting the DLL with a log file** rather
+than by reasoning. The DLL is loaded into whichever process activates it and
+has no console or attachable debugger, so a log in a world-writable path is
+the only practical visibility. It showed the DLL loading, the factory being
+asked for an unknown IID, and `CopyTo` failing - which turned an open-ended
+guess into a one-line lookup. Keep that logging.
+
+Also learned: `Start` validates by activating the source **in the calling
+process**, not in Frame Server. So it proves registration and interfaces,
+but it still does not answer whether Frame Server can load the DLL when a
+real consumer opens the camera.
+
+### Third round: IMFActivate works, and HKLM is mandatory after all
+
+The activation layer is in and correct. The DLL log now shows the full
+handshake succeeding: factory asked for `IMFActivate` and returns S_OK,
+`ActivateObject` called for `{3C9B2EB9-86D5-4514-A394-F56664F9F0D8}`, media
+source created and handed over, all S_OK.
+
+`Start` now fails with **`0x80070003` (ERROR_PATH_NOT_FOUND)** - a different
+and later failure than before. Two hypotheses tested and eliminated:
+
+- **Not the drive.** H: is a local disk, not a mapped network drive.
+- **Not the DLL's location or ACLs.** Copying the DLL to
+  `C:\ProgramData\normalish\` and registering it from there gives the
+  identical error.
+
+The answer came from smourier's VCamSample/VCamNetSample, which is
+*unpackaged* and therefore matches our situation, unlike Microsoft's
+MSIX-packaged sample. Its README is emphatic: **the media source must be
+registered in HKLM, not HKCU, and registration must be run as
+administrator**, because the DLL is loaded by multiple processes. Our
+symptom is consistent with that: per-user registration satisfies the
+in-process activation and then fails when the camera is published.
+
+So the deployment story does need a **one-time elevated registration**.
+Nothing machine-wide has been touched yet; the HKCU key used for testing was
+removed.
+
+### Also learned, relevant later
+
+- Most consumers prefer **NV12**. That sample offers both RGB32 and NV12
+  and notes that most environments want NV12, so our RGB32-only source may
+  need a second format before Teams is happy.
+- Consumers may hand the source a **Direct3D manager**; a CPU fallback is
+  required when they do not. Returning `E_NOTIMPL` from `SetD3DManager`, as
+  we do, is the documented way to force the CPU path.
+
+### Fourth round: Frame Server loads the DLL
+
+Registered in HKLM with `regsvr32` under elevation, pointing at
+`C:\ProgramData\normalish\normalish_vcam.dll` - a stable path, deliberately
+not `build\`, which `-Clean` wipes.
+
+**The big question is answered.** The DLL log shows:
+
+    DLL loaded into C:\windows\System32\svchost.exe
+
+That is the Camera Frame Server. It resolved the CLSID, asked for
+`IMFActivate`, called `ActivateObject` for
+`{279A808D-AEC7-40C8-9C6B-A6B492C78A66}` and got the media source, all
+S_OK. So a machine-wide registration genuinely lets the system host our
+source out of process. Everything from here is ordinary work.
+
+`Start` now fails with **`MF_E_ATTRIBUTENOTFOUND` (0xC00D36E6)**. Logging
+every attribute lookup that misses named the culprits: the activation object
+carries only `MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES`, but is asked for
+the standard device-source attributes that a real camera's activate object
+has:
+
+- `MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE` (should be the VIDCAP GUID)
+- `MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME`
+- `MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK`
+- `MF_DEVSOURCE_ATTRIBUTE_FRAMESERVER_SHARE_MODE`
+- `MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES`
+
+Some of those lookups are probably optional probes - Media Foundation tests
+for an attribute's presence with `GetItemType` - so they need adding and
+retrying rather than assuming all five are mandatory.
+
+Worth noting how much cheaper instrumentation has been than reasoning here.
+Both hard blockers - the missing `IMFActivate` and now the missing
+attributes - were found by making the DLL log what was asked of it. Neither
+was guessable from the error code alone, since both surface as a single
+opaque HRESULT from `Start`.
+
+### Fifth round: the camera exists and is selectable; no frames yet
+
+`Start` succeeds. The fix was that `GetStreamAttributes` was returning the
+*source's* attribute store, which has no stream category or stream id -
+MF asks for those per stream, and the miss surfaced as
+`MF_E_ATTRIBUTENOTFOUND`. The source now keeps a separate stream attribute
+store.
+
+**Verified in a real consumer.** The Windows Camera app lists the camera and
+switching to it works - the preview changes away from the physical webcam.
+So enumeration, selection and format negotiation (1280x720) all work
+end-to-end from a third-party application.
+
+**But the preview is black: no samples flow.** In the Frame Server process,
+our source is activated, its source and stream attributes are read, and then
+nothing - no `CreatePresentationDescriptor`, no `Start`, no `RequestSample`.
+Frame Server then re-reads the source attributes every few seconds, as if
+polling. The earlier `CreatePresentationDescriptor` in the log came from the
+harness process during `IMFVirtualCamera::Start` validation, not from a
+consumer.
+
+Ruled out as causes, all being optional probes that succeed or are refused
+harmlessly while `Start` still returns S_OK:
+- `IMFCollection` QueryInterface, refused.
+- `IMFExtendedCameraController` via `GetService`, unsupported.
+- `PROPSETID_VIDCAP_CAMERACONTROL` property 8 via `IKsControl`, E_NOTIMPL.
+
+Switched the advertised format from RGB32 to **NV12**, since most capture
+stacks expect it from a camera. That did not change the symptom, so the
+blockage is elsewhere - though NV12 is the right format to keep.
+
+**A test design mistake worth recording.** The first consumer test pointed
+normalish's own input dropdown at our virtual camera. That is circular -
+normalish is meant to *produce* those frames - and it made the architecture
+look inverted. It did legitimately prove another process could enumerate and
+open the camera, but the proper test is a third-party consumer while
+normalish stays on the real webcam. Related fix needed: **normalish must
+exclude its own virtual camera from its input device list**, or the option
+to create a feedback loop is sitting right there in the UI.
+
+### Sixth round: closer, still no frames
+
+Read the working unpackaged implementation (smourier/VCamSample) and closed
+four real gaps rather than guessing:
+
+- `IMFSampleAllocatorControl` on the source, reporting a custom allocator.
+- `MFT_TRANSFORM_CLSID_Attribute` set to our own CLSID, which tells Frame
+  Server what to instantiate for the streaming pipeline.
+- `MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES` set to 1, matching
+  the working sample rather than the 0 that seemed more logical.
+- **`MF_DEVICEMFT_SENSORPROFILE_COLLECTION`** - a sensor profile collection
+  (KSCAMERAPROFILE_Legacy with filter `((RES==;FRT<=30,1;SUT==))`), needed
+  for Frame Server to know what the camera can do. Requires linking
+  `mfsensorgroup`.
+- The source is now built in the activation object's constructor rather than
+  lazily in `ActivateObject`, because constructing it is what puts the
+  sensor profile into the attribute store, and Frame Server reads those
+  attributes *before* calling `ActivateObject`.
+
+Also replaced the flaky test method. The Windows Camera app remembers its
+last device and its switch button toggles, so it was never clear which
+camera was open; several conclusions were drawn from runs where the real
+webcam was selected. There is now a purpose-built consumer that finds the
+camera by name and prints exact HRESULTs.
+
+Where it stands: the consumer finds "normalish camera (Windows Virtual
+Camera)", activates it, creates a source reader, sees a 1280x720 RGB32
+native type (Frame Server converts our NV12), gets one stream tick, then
+blocks forever in ReadSample. Our source is still never asked for a
+presentation descriptor or a sample.
+
+Two mistakes of method worth recording, both the same shape - not verifying
+a precondition:
+- One "device invalidated" result came from a run where the harness holding
+  the camera had already exited. The camera's owner must be alive.
+- `GetSourceAttributes` returns the raw MF attribute store, so every read
+  Frame Server performs on it **bypasses our logging**. The absence of
+  sensor-profile reads in the log therefore proves nothing. Instrumentation
+  has to wrap the returned store, not just the activation object, before its
+  silence can be trusted.
+
+### Seventh round: working baseline obtained, ours still silent
+
+Built and ran smourier/VCamSample on this machine. **It streams.** The
+purpose-built consumer reads 4,915,200-byte frames (1280x960 RGB32) from it
+with advancing timestamps. That settles the biggest open question: the
+environment, `MFCreateVirtualCamera`, HKLM registration and unpackaged COM
+DLLs all work here. **The bug is ours.**
+
+Building it needed no tooling beyond what is installed: MSBuild from Build
+Tools, toolset v145 matching our MSVC 14.50, and its two NuGet packages
+fetched by hand as zips since nuget.exe is absent.
+
+Diffed against it and closed every difference found:
+- Both RGB32 and NV12 offered, RGB32 first (it advertises two native types;
+  we advertised one).
+- `MF_DEVICESTREAM_FRAMESERVER_SHARED = 1` on the stream attributes.
+- `MF_MT_AVG_BITRATE` on each media type.
+- The source and the stream now implement `IMFAttributes` themselves, and
+  `GetSourceAttributes`/`GetStreamAttributes` return those objects rather
+  than a bare attribute store.
+
+**None of it changed the symptom.** Frame Server's own event log is
+byte-for-byte the same shape for both cameras - same initialisation, same
+`SetOutputType` succeeding, same watchdog - yet our source is never asked
+for a presentation descriptor or a sample, and the consumer blocks forever
+after one stream tick. Our model of why is wrong somewhere not visible from
+either log.
+
+### Remaining work
+
+### Eighth round: allocator contract matched, still no frames
+
+More differences found and closed, all from the reference:
+- `GetAllocatorUsage` now reports `MFSampleAllocatorUsage_UsesProvidedAllocator`
+  rather than a custom allocator, and `SetDefaultAllocator` hands the
+  allocator to the stream, which initialises it with the media type and
+  allocates samples from it.
+- `SetD3DManager` returns S_OK rather than E_NOTIMPL - accepted and ignored,
+  which is how the reference forces the CPU path.
+
+Still no frames. Their stream initialisation is now confirmed identical to
+ours in shape: two media types, `MFCreateStreamDescriptor`, then
+`SetCurrentMediaType(types[0])`.
+
+One unexplained asymmetry stands out and is the best remaining clue: a
+consumer sees **two** native types from the reference but only **one** from
+ours, even though our descriptor now carries both. Frame Server is
+evidently not taking its type list from our descriptor.
+
+**Conclusion on method:** mirroring the reference onto our own WRL skeleton
+has now failed across eight rounds, and each round costs a build, a deploy
+and a test cycle. Every difference found has been real and worth fixing, but
+the one that matters is not visible by reading. Continuing to mirror is not
+converging.
+
+### IT WORKS - and the root cause was not in the code at all
+
+Adopted the reference's actual sources into `src/vcam` (MIT, attribution in
+`src/vcam/LICENSE-VCamSample.txt`), changed to our CLSID, dropped the
+packaged-app identity lookup, and moved the build to CMake. Two build fixes
+were needed: `UNICODE`/`_UNICODE` must be defined, or every Win32 call
+resolves to its `...A` variant, and WIL comes from FetchContent
+(microsoft/wil, pinned to the version the source was written against) while
+`winrt/base.h` ships in the Windows SDK.
+
+It still did not stream - and then the reported media type gave it away:
+the consumer saw **1280x720**, our old dimensions, while the adopted source
+uses **1280x960**.
+
+**The Camera Frame Server caches a device's configuration per CLSID.** Our
+very first `Start` succeeded against an early, incomplete source, and Frame
+Server cached that. Every subsequent test - every attribute added, every
+interface implemented, every format change, and finally an entire
+replacement implementation - was served the same stale device. Restarting
+the FrameServer service and re-running produced frames immediately:
+
+    native type 0: 1280x960 subtype 00000016   (RGB32)
+    native type 1: 1280x960 subtype 3231564E   (NV12)
+    ReadSample 1: OK  4915200 bytes  ts=253608600036
+    ReadSample 2: OK  4915200 bytes  ts=253608735649
+    ...
+
+**Uncomfortable consequence: most of rounds five through eight were tested
+against a cached device and their conclusions are worthless.** Several of
+those changes may well have been correct and simply invisible. Which of them
+were actually necessary is now unknown, and finding out would mean
+re-testing each in isolation with a service restart between. The
+from-scratch attempt was not kept: this branch was squashed to a single
+commit before the feature work began, so it exists only as the account
+written here.
+
+**The lesson, and it is a general one:** when a change appears to have no
+effect at all, suspect that the thing under test is not the thing you
+changed. Eight rounds of careful, evidence-based fixes produced no visible
+movement because the system under test was a cached copy. That possibility
+should have been checked far earlier - the DLL-locking behaviour was already
+a hint that something outside the build was holding state.
+
+Anything touching `src/vcam` now needs `Restart-Service FrameServer -Force`
+between builds. Documented in the README.
+
+### Superseded plan (kept for the record)
+
+1. **Adopt the reference's actual source files** rather than mirroring them.
+   In tree, MIT with attribution, dependencies satisfied without NuGet: WIL
+   is header-only (FetchContent from microsoft/wil) and `winrt/base.h` ships
+   in the Windows SDK, already on the include path. Change only the CLSID and
+   friendly name, confirm it streams, and only then replace its frame
+   generator with frames from normalish. This removes transcription risk
+   entirely, which is the risk that has actually been biting.
+2. **Or bisect against the working baseline.** Mechanical rather
+   than speculative: the reference is MIT licensed and in the same
+   environment, so parts can be swapped between the two implementations
+   until the responsible difference falls out. Slower per step but it
+   terminates, which speculation has not.
+2. Alternative worth weighing seriously: adopt the reference media source as
+   the basis for `src/vcam` (MIT, attribution required) and adapt it to take
+   frames from normalish, rather than finishing a from-scratch
+   implementation. The interesting part of this project is the relighting,
+   not re-deriving Frame Server's undocumented expectations.
+3. Superseded by the above, kept for context: get a working baseline. Build
+   smourier/VCamSample itself on this machine. If its camera streams, diff
+   observable behaviour against ours; if it does not, the problem is
+   environmental and no amount of changing our code would have found it.
+   This is worth more than another round of speculative fixes.
+2. Wrap the attribute store returned by `GetSourceAttributes` in a logging
+   proxy so its reads are visible.
+3. Remaining structural differences from the sample: the source and stream
+   implement `IMFAttributes` themselves (copying the activate's items), and
+   the stream implements `IKsControl`.
+4. **Find why Frame Server never asks for a presentation descriptor.** The
+   next move is not more guessing: read the media source in smourier's
+   VCamSample, which is a working *unpackaged* C++ implementation, and diff
+   its source and stream setup against ours. Candidate suspects are frame
+   rate range attributes on the media type
+   (`MF_MT_FRAME_RATE_RANGE_MIN`/`MAX`) and the missing
+   `MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK`.
+2. Filter our own virtual camera out of normalish's input list.
+3. Populate the activation object's attributes and retry `Start`.
+2. Confirm the camera appears to a separate process. normalish's own device
+   dropdown is a convenient first consumer, before trying Teams.
+3. Probably add NV12 alongside RGB32.
+4. Frame transport from normalish, then render-to-texture and readback.
+5. The toggle and lifecycle.
+6. **"Install camera support" button in the panel**, since registration
+   needs elevation and cannot be done silently. Requested 2026-09-08: a
+   button, plus an **info button beside it** explaining what the
+   registration actually does - that it writes one machine-wide COM entry
+   mapping our CLSID to the DLL, that no camera appears in anyone's list
+   until normalish is running with the toggle on, that nothing runs at boot,
+   and that it is reversible. normalish should detect the missing
+   registration and offer this rather than failing opaquely.
+3. Frame transport: shared memory plus synchronisation, since the DLL is
+   loaded by Frame Server in a different process and cannot see our memory.
+4. Render to texture and read back in normalish, excluding the control panel
+   from what the camera sees. This is new: nothing currently reads pixels
+   back from the GPU, and at 1080p that is roughly 8 MB per frame plus
+   latency.
+5. The toggle, lifecycle and graceful failure, greyed out with a reason when
+   `MFIsVirtualCameraTypeSupported` says no.
+
 ## Open questions / decisions deferred to when we hit them
 
 - Webcam library choice (Phase 5) - deliberately not decided yet. Note that
