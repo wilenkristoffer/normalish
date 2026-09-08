@@ -45,36 +45,65 @@ static inline void BgraToYuv(BYTE b, BYTE g, BYTE r, BYTE* y, BYTE* u, BYTE* v)
     *v = (BYTE)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 }
 
-bool NormalishFrames::TryFill(BYTE* destination, UINT32 width, UINT32 height, const GUID& format)
+// One seqlock read attempt into _lastGood. An odd sequence means a write is in
+// progress; a changed sequence means the frame was replaced mid-copy.
+bool NormalishFrames::Acquire(UINT32 width, UINT32 height)
 {
-    if (destination == nullptr) return false;
-    if (!EnsureMapped()) return false;
-
     auto header = (NormalishFrameHeader*)_view;
     if (header->magic != NORMALISH_FRAME_MAGIC) return false;
     if (header->version != NORMALISH_FRAME_VERSION) return false;
     if ((header->width != width) || (header->height != height)) return false;
 
     const size_t frameBytes = (size_t)width * height * 4;
-    if (_staging.size() < frameBytes) _staging.resize(frameBytes);
+    if (_lastGood.size() < frameBytes) _lastGood.resize(frameBytes);
 
-    // Seqlock: an odd sequence means a write is in progress, and a changed
-    // sequence means the frame was replaced mid-copy. Either way, skip this
-    // one - the next request is 33 ms away.
     unsigned int before = header->sequence;
     if ((before & 1u) != 0u) return false;
     MemoryBarrier();
-    memcpy(_staging.data(), _view + sizeof(NormalishFrameHeader), frameBytes);
+    memcpy(_lastGood.data(), _view + sizeof(NormalishFrameHeader), frameBytes);
     MemoryBarrier();
-    if (header->sequence != before) return false;
+    return header->sequence == before;
+}
 
-    const BYTE* source = _staging.data();
+bool NormalishFrames::TryFill(BYTE* destination, UINT32 width, UINT32 height, const GUID& format)
+{
+    if (destination == nullptr) return false;
+    if ((format != MFVideoFormat_RGB32) && (format != MFVideoFormat_NV12)) return false;
+    if (!EnsureMapped()) return false;
+
+    // A few quick attempts: the writer's window is about a millisecond, so a
+    // retry usually lands between writes rather than losing the frame.
+    bool fresh = false;
+    for (int attempt = 0; (attempt < 3) && !fresh; attempt++)
+    {
+        fresh = Acquire(width, height);
+        if (!fresh) Sleep(1);
+    }
+
+    if (fresh) _consecutiveMisses = 0;
+    else
+    {
+        // Reuse the previous frame rather than showing a test pattern. Give up
+        // only after about a second, by which point normalish has most likely
+        // been closed and the pattern is the honest thing to show.
+        if (_lastGood.empty()) return false;
+        if (++_consecutiveMisses > 30) return false;
+    }
+
+    Convert(destination, width, height, format);
+    return true;
+}
+
+void NormalishFrames::Convert(BYTE* destination, UINT32 width, UINT32 height, const GUID& format) const
+{
+    const BYTE* source = _lastGood.data();
+    const size_t frameBytes = (size_t)width * height * 4;
 
     if (format == MFVideoFormat_RGB32)
     {
         // Already BGRA, and normalish writes rows top-down for us.
         memcpy(destination, source, frameBytes);
-        return true;
+        return;
     }
 
     if (format == MFVideoFormat_NV12)
@@ -108,8 +137,5 @@ bool NormalishFrames::TryFill(BYTE* destination, UINT32 width, UINT32 height, co
                 outUV[x * 2 + 1] = v;
             }
         }
-        return true;
     }
-
-    return false;
 }
