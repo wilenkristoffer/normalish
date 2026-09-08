@@ -780,7 +780,7 @@ gradient boost. Test it early in D2 rather than discovering it at the end.
 **The real cost, stated plainly:** about 27 MB of binaries (onnxruntime.dll
 17 MB, DirectML.dll 10 MB) plus a 99 MB model file.
 
-#### D2 - integration, shaped by what D1 measures
+#### D2 - integration (DONE, with one thing outstanding)
 
 - **Inference on a worker thread, not the render loop.** The existing webcam
   capture already establishes the pattern, and for the same reason: a
@@ -805,6 +805,56 @@ gradient boost. Test it early in D2 rather than discovering it at the end.
 - **Temporal smoothing.** ML depth flickers frame to frame, and flicker in a
   relight is far more obvious than in a depth visualisation. An exponential
   moving average per pixel, accepting some ghosting on fast movement.
+
+**Result.** The live webcam feed is relit from model depth at 60 FPS, with
+the model on its own thread and inference at about 22 ms. The depth map of a
+real room is good - head and shoulders cleanly nearest, glasses visible, bed,
+curtain, lamp and microphone arm all at plausible depths, and a crisp
+silhouette.
+
+Three bugs found by looking at it, each a scale assumption:
+
+- **Every depth-mode range was calibrated to the synthetic scene**, whose
+  subject sits at 0.62 m and wall at 1.3 m. A real room runs 1.9 to 8 m, so
+  the depth view clipped to black, the light distance slider could not reach
+  the subject at its 1.5 m maximum, and falloff 8.0 extinguished the light.
+  Fixed structurally rather than by retuning: `DepthFrame` now carries the
+  scene's near and far, the model reports its own range as robust
+  percentiles, and the light distance, view mapping, shadow thickness, shadow
+  bias, march span and slider ranges all derive from those. Falloff is
+  measured relative to the nearest surface, so one setting means the same
+  thing at any scale. Depth mode keeps its own falloff and distance, because
+  the luminance model measures in image heights and this one in metres.
+- **`texelSize` is the albedo's, not the depth map's.** The model returns 518
+  wide against a 1280-wide frame, so the gradient taps landed inside a single
+  depth texel where the bilinear interpolation is piecewise linear, and the
+  normals followed the interpolation grid instead of the surface - visible as
+  vertical streaking. A separate `depthTexelSize` fixes it. This never showed
+  on the synthetic scenes because there both textures are the same size.
+- **Normals from monocular depth are dominated by the model's own error.**
+  This is the D1 risk arriving. At 2.5 m the frame covers about 3.5 m across
+  518 texels, so one depth texel is roughly 7 mm of scene; a 5 mm depth error
+  between neighbours tilts the normal by 36 degrees, and the model undulates
+  by centimetres because it is trained for depth accuracy, not gradient
+  accuracy. Widening the taps was tried first and made it **worse** - it
+  turns fine noise into large blobs rather than removing it, because the
+  error is low-frequency. What works is attenuating the tilt: scaling the
+  normal's lateral components and renormalising, which softens shape without
+  distorting its direction. A `Relief` control, 0.30 for the model and 1.0
+  for exact synthetic depth.
+
+**What is outstanding, and it is the interesting part.** With relief at 0.30
+the subject looks genuinely good - the face reads as a lit face, the wall
+behind takes a clean cast shadow - but the background clutter is still badly
+artefacted, worst on a curtain at a grazing angle where the model's depth is
+least reliable. The artefacts are concentrated in exactly the part of the
+frame nobody wants relit.
+
+So the next step is **relight the subject, leave the room alone**: threshold
+the depth to the nearest coherent region and blend the original frame back in
+outside it. That is nearly free now that depth exists, it removes the worst
+of the artefacts by construction, it is what the effect is actually for in a
+call, and it retires the background masking deferred back in phase 4.
 
 #### Expectation to set now
 

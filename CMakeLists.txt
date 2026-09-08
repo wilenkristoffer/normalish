@@ -32,10 +32,54 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raygui)
 
-add_executable(normalish src/main.c src/webcam.c src/vcamhost.c src/depth.c)
+# Monocular depth estimation. ONNX Runtime is reached through its C API, so no
+# C++ enters normalish itself; it is a prebuilt binary plus a model file that
+# is downloaded separately. Second scoped exception to the C-and-raylib rule,
+# agreed 2026-09-08 and recorded in PLAN.md.
+#
+# NuGet packages are plain zips and nuget.exe is not installed here, so they
+# are fetched straight from the API. DOWNLOAD_NAME gives the .nupkg a .zip
+# extension so FetchContent knows how to unpack it; neither package has a
+# CMakeLists.txt, so MakeAvailable only populates.
+set(ORT_VERSION 1.24.4)
+set(DML_VERSION 1.15.4)
+
+FetchContent_Declare(
+    onnxruntime
+    URL https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${ORT_VERSION}
+    DOWNLOAD_NAME onnxruntime-directml-${ORT_VERSION}.zip
+)
+FetchContent_MakeAvailable(onnxruntime)
+
+# DirectML.dll is not in the ONNX Runtime package - that declares a dependency
+# on this one instead. Windows does ship a DirectML.dll in System32, but not
+# necessarily the version ONNX Runtime was built against, so ship this one.
+FetchContent_Declare(
+    directml
+    URL https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/${DML_VERSION}
+    DOWNLOAD_NAME directml-${DML_VERSION}.zip
+)
+FetchContent_MakeAvailable(directml)
+
+set(ORT_INCLUDE_DIR ${onnxruntime_SOURCE_DIR}/build/native/include)
+set(ORT_RUNTIME_DIR ${onnxruntime_SOURCE_DIR}/runtimes/win-x64/native)
+
+add_executable(normalish src/main.c src/webcam.c src/vcamhost.c src/depth.c src/depthmodel.c)
 # Media Foundation supplies webcam capture; it ships with Windows. mf.lib is
 # needed for MFEnumDeviceSources specifically, which is not in mfplat.lib.
-target_link_libraries(normalish PRIVATE raylib mf mfplat mfreadwrite mfuuid mfsensorgroup ole32)
+target_include_directories(normalish PRIVATE ${ORT_INCLUDE_DIR})
+target_link_libraries(normalish PRIVATE raylib mf mfplat mfreadwrite mfuuid mfsensorgroup ole32
+    ${ORT_RUNTIME_DIR}/onnxruntime.lib)
+
+# onnxruntime.dll needs DirectML.dll beside it, and both need to be beside the
+# executable rather than only in the fetch cache.
+add_custom_command(TARGET normalish POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${ORT_RUNTIME_DIR}/onnxruntime.dll
+        ${ORT_RUNTIME_DIR}/onnxruntime_providers_shared.dll
+        ${directml_SOURCE_DIR}/bin/x64-win/DirectML.dll
+        $<TARGET_FILE_DIR:normalish>
+    COMMENT "Copying ONNX Runtime and DirectML next to normalish.exe")
 target_include_directories(normalish PRIVATE ${raygui_SOURCE_DIR}/src)
 
 # Load shaders straight from the source tree so the in-app reload key picks up

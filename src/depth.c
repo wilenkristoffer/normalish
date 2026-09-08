@@ -200,6 +200,17 @@ bool GenerateSyntheticScene(SyntheticScene *out, DepthScene scene,
         }
     }
 
+    float lo = 1.0e30f, hi = 0.0f;
+    for (size_t i = 0; i < pixels; i++)
+    {
+        float z = out->depth.depth[i];
+        if (z <= 0.0f) continue;
+        if (z < lo) lo = z;
+        if (z > hi) hi = z;
+    }
+    out->depth.nearMetres = (hi > 0.0f) ? lo : 0.0f;
+    out->depth.farMetres = hi;
+
     return true;
 }
 

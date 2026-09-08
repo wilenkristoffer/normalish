@@ -2,6 +2,7 @@
 #include "webcam.h"
 #include "vcamhost.h"
 #include "depth.h"
+#include "depthmodel.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -57,6 +58,9 @@ typedef struct RelightShader {
     int tanHalfFovXLoc;
     int depthSpacingLoc;
     int depthRangeLoc;
+    int distanceScaleLoc;
+    int depthTexelSizeLoc;
+    int depthReliefLoc;
     int shadowStepsLoc;
     int shadowBiasLoc;
     int shadowThicknessLoc;
@@ -93,6 +97,9 @@ static RelightShader LoadRelightShader(void)
     r.tanHalfFovXLoc = GetShaderLocation(r.shader, "tanHalfFovX");
     r.depthSpacingLoc = GetShaderLocation(r.shader, "depthSpacing");
     r.depthRangeLoc = GetShaderLocation(r.shader, "depthRange");
+    r.distanceScaleLoc = GetShaderLocation(r.shader, "distanceScale");
+    r.depthTexelSizeLoc = GetShaderLocation(r.shader, "depthTexelSize");
+    r.depthReliefLoc = GetShaderLocation(r.shader, "depthRelief");
     r.shadowStepsLoc = GetShaderLocation(r.shader, "shadowSteps");
     r.shadowBiasLoc = GetShaderLocation(r.shader, "shadowBias");
     r.shadowThicknessLoc = GetShaderLocation(r.shader, "shadowThickness");
@@ -280,6 +287,15 @@ static int VerifyNormals(RelightShader rs, DepthScene which, int width, int heig
     SetShaderValue(rs.shader, rs.depthSpacingLoc, &spacing, SHADER_UNIFORM_FLOAT);
     SetShaderValue(rs.shader, rs.depthRangeLoc, range, SHADER_UNIFORM_VEC2);
     SetShaderValue(rs.shader, rs.texelSizeLoc, texel, SHADER_UNIFORM_VEC2);
+    // The depth map is the same size as the albedo here, but it has to be set
+    // explicitly all the same: leaving it at zero collapses the gradient taps
+    // onto a single texel, which is how this check caught the uniform being
+    // missed in the first place.
+    SetShaderValue(rs.shader, rs.depthTexelSizeLoc, texel, SHADER_UNIFORM_VEC2);
+    float verifyScale = 1.0f;
+    SetShaderValue(rs.shader, rs.distanceScaleLoc, &verifyScale, SHADER_UNIFORM_FLOAT);
+    // Ground truth is the unattenuated surface, so keep all of the tilt.
+    SetShaderValue(rs.shader, rs.depthReliefLoc, &verifyScale, SHADER_UNIFORM_FLOAT);
 
     Rectangle whole = { 0.0f, 0.0f, (float)width, (float)height };
 
@@ -498,6 +514,11 @@ int main(int argc, char **argv)
     // under real depth, one keystroke apart.
     int geometryMode = GEOMETRY_DEPTH;
     float depthSpacing = 1.0f;
+    // Exact depth wants all of the measured tilt; a monocular model does not.
+    // Set per source below rather than as one default, because the right value
+    // differs by an order of magnitude between them.
+    float depthRelief = 1.0f;
+    bool reliefFollowsSource = true;
 
     // Shadows: 24 steps is enough for a head at this scale and costs little.
     // The thickness default is roughly the depth of a head, which is the
@@ -510,6 +531,29 @@ int main(int argc, char **argv)
     // reads back as "no data", which the shader already handles; leaving the
     // sampler unbound would instead read whatever texture happened to be on
     // that unit.
+    // Live depth from the ML model, for the webcam feed. The texture is
+    // recreated when the model's crop size changes, which happens if the
+    // capture resolution or aspect changes.
+    bool depthModelReady = InitDepthModel();
+    TraceLog(LOG_INFO, "DEPTH: model %s", GetDepthModelStatus());
+    Texture2D liveDepth = { 0 };
+    int liveDepthW = 0, liveDepthH = 0;
+    bool haveLiveDepth = false;
+    // A webcam's horizontal field of view is not something we can query, and
+    // the unprojection needs it. 70 degrees is typical; the slider lets it be
+    // matched by eye, since getting it wrong only makes the relief too strong
+    // or too weak rather than breaking anything.
+    float cameraFovDegrees = 70.0f;
+
+    // Depth mode keeps its own falloff and light distance. The luminance model
+    // measures distance in image heights and the depth model in metres, so a
+    // single value cannot mean the right thing in both. Falloff here is
+    // relative to the scene's nearest surface, so it survives a change of
+    // scene scale.
+    float depthFalloff = 2.0f;
+    float depthLightDistance = 0.7f;
+    float knownSceneNear = 0.0f;
+
     float noDepthTexel = 0.0f;
     Image noDepthImage = {
         .data = &noDepthTexel, .width = 1, .height = 1, .mipmaps = 1,
@@ -551,6 +595,39 @@ int main(int argc, char **argv)
             Vector2 found = { 0 };
             tracking = TrackBrightestPoint(webcamFrame, 4, &found);
             if (tracking) trackedPoint = found;
+
+            // The worker drops the frame if it is still busy, so this is a
+            // submission attempt rather than a queue.
+            if (depthModelReady)
+                SubmitDepthFrame((const unsigned char *)webcamFrame.data,
+                                 webcamFrame.width, webcamFrame.height);
+        }
+
+        if (depthModelReady)
+        {
+            const float *fresh = NULL;
+            int freshW = 0, freshH = 0;
+            if (TakeLatestDepth(&fresh, &freshW, &freshH))
+            {
+                if ((freshW != liveDepthW) || (freshH != liveDepthH))
+                {
+                    if (liveDepth.id != 0) UnloadTexture(liveDepth);
+                    Image image = {
+                        .data = (void *)fresh, .width = freshW, .height = freshH,
+                        .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R32
+                    };
+                    liveDepth = LoadTextureFromImage(image);
+                    // Bilinear here, unlike the synthetic scenes: this map is
+                    // 518 wide against a 1280-wide frame, and point sampling
+                    // that far upscaled is visibly blocky. It does soften
+                    // silhouettes, which is the known trade.
+                    SetTextureFilter(liveDepth, TEXTURE_FILTER_BILINEAR);
+                    liveDepthW = freshW;
+                    liveDepthH = freshH;
+                }
+                else UpdateTexture(liveDepth, fresh);
+                haveLiveDepth = (liveDepth.id != 0);
+            }
         }
 
         // Layout is recomputed every frame, so the window can be resized and
@@ -582,12 +659,55 @@ int main(int argc, char **argv)
         // Depth mode is only meaningful where there is a depth map. The photo
         // and the webcam have none yet, so they stay on the luminance model
         // whatever the setting says.
-        bool depthAvailable = (syntheticIndex >= 0);
+        // Depth is available from a synthetic scene, or from the model on the
+        // live feed once it has produced its first result.
+        bool liveDepthUsable = (sourceMode == 1) && haveLiveDepth;
+        bool depthAvailable = (syntheticIndex >= 0) || liveDepthUsable;
         int activeGeometry = (depthAvailable && (geometryMode == GEOMETRY_DEPTH))
                            ? GEOMETRY_DEPTH : GEOMETRY_LUMINANCE;
-        float tanHalfFovX = depthAvailable ? synthetic[syntheticIndex].scene.depth.tanHalfFovX
-                                           : SYNTHETIC_FOV_TAN;
-        Texture2D activeDepth = depthAvailable ? synthetic[syntheticIndex].depth : noDepth;
+
+        float tanHalfFovX = SYNTHETIC_FOV_TAN;
+        Texture2D activeDepth = noDepth;
+        if (syntheticIndex >= 0)
+        {
+            tanHalfFovX = synthetic[syntheticIndex].scene.depth.tanHalfFovX;
+            activeDepth = synthetic[syntheticIndex].depth;
+        }
+        else if (liveDepthUsable)
+        {
+            tanHalfFovX = tanf(cameraFovDegrees*0.5f*PI/180.0f);
+            activeDepth = liveDepth;
+        }
+
+        // Follow the source until the slider is touched, then leave it alone.
+        if (reliefFollowsSource) depthRelief = (syntheticIndex >= 0) ? 1.0f : 0.30f;
+
+        // The scene's own range drives the light distance slider, the depth
+        // view mapping and the falloff scale.
+        float sceneNear = 0.6f, sceneFar = 1.5f;
+        if (syntheticIndex >= 0)
+        {
+            sceneNear = synthetic[syntheticIndex].scene.depth.nearMetres;
+            sceneFar = synthetic[syntheticIndex].scene.depth.farMetres;
+        }
+        else if (liveDepthUsable) GetDepthRange(&sceneNear, &sceneFar);
+        if (sceneFar <= sceneNear) sceneFar = sceneNear + 1.0f;
+
+        // When the scene's scale changes materially - switching from a
+        // synthetic head at 0.6 m to a room running to 8 m - a light distance
+        // set for the old scale is useless. Put it just behind the nearest
+        // surface, which is where the effect this branch exists for lives.
+        if ((knownSceneNear <= 0.0f) ||
+            (sceneNear > knownSceneNear*1.6f) || (sceneNear < knownSceneNear*0.625f))
+        {
+            knownSceneNear = sceneNear;
+            depthLightDistance = sceneNear*1.15f;
+            // Thickness and bias are metres as well, so they scale with the
+            // scene. These factors reproduce the values hand-tuned against
+            // the synthetic head, whose nearest surface is about 0.5 m.
+            shadowThickness = sceneNear*0.68f;
+            shadowBias = sceneNear*0.012f;
+        }
 
         Rectangle quad = FitRectangle(area, albedoTexture.width, albedoTexture.height);
         float aspect = quad.width/quad.height;
@@ -658,7 +778,16 @@ int main(int argc, char **argv)
             // frustum at the chosen distance using the same unprojection the
             // shader uses, so pushing it back keeps it visually where it was
             // put and simply moves it past the subject.
-            float z = activeHeight;
+            // The full demo drives the light's height, which in this mode is
+            // its distance. Map its 0.02..0.25 sweep onto half to one and a
+            // half times the nearest surface, so the light travels from in
+            // front of the subject to behind them.
+            float z = depthLightDistance;
+            if (demoEnabled && (demoMode == 1))
+            {
+                float t = (activeHeight - 0.02f)/0.23f;
+                z = sceneNear*(0.5f + 1.0f*t);
+            }
             lightPos[0] = (lightImageU*2.0f - 1.0f)*tanHalfFovX*z;
             lightPos[1] = (lightV*2.0f - 1.0f)*(tanHalfFovX/aspect)*z;
             lightPos[2] = z;
@@ -676,7 +805,8 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.lightPosLoc, lightPos, SHADER_UNIFORM_VEC3);
         SetShaderValue(rs.shader, rs.lightColorLoc, lightColor, SHADER_UNIFORM_VEC3);
         SetShaderValue(rs.shader, rs.lightIntensityLoc, &light.intensity, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(rs.shader, rs.falloffLoc, &light.falloff, SHADER_UNIFORM_FLOAT);
+        float activeFalloff = (activeGeometry == GEOMETRY_DEPTH) ? depthFalloff : light.falloff;
+        SetShaderValue(rs.shader, rs.falloffLoc, &activeFalloff, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.ambientLoc, &light.ambient, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.specularStrengthLoc, &light.specularStrength, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.shininessLoc, &light.shininess, SHADER_UNIFORM_FLOAT);
@@ -688,8 +818,15 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.geometryModeLoc, &activeGeometry, SHADER_UNIFORM_INT);
         SetShaderValue(rs.shader, rs.tanHalfFovXLoc, &tanHalfFovX, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.depthSpacingLoc, &depthSpacing, SHADER_UNIFORM_FLOAT);
-        float depthRange[2] = { 0.35f, 1.45f };
+        float depthRange[2] = { sceneNear, sceneFar };
         SetShaderValue(rs.shader, rs.depthRangeLoc, depthRange, SHADER_UNIFORM_VEC2);
+        float distanceScale = (activeGeometry == GEOMETRY_DEPTH) ? sceneNear : 1.0f;
+        SetShaderValue(rs.shader, rs.distanceScaleLoc, &distanceScale, SHADER_UNIFORM_FLOAT);
+        // The depth map's own resolution, which is not the albedo's once the
+        // depth comes from the model.
+        float depthTexel[2] = { 1.0f/(float)activeDepth.width, 1.0f/(float)activeDepth.height };
+        SetShaderValue(rs.shader, rs.depthTexelSizeLoc, depthTexel, SHADER_UNIFORM_VEC2);
+        SetShaderValue(rs.shader, rs.depthReliefLoc, &depthRelief, SHADER_UNIFORM_FLOAT);
         // Zero steps is how shadows are turned off, so the slider is both the
         // switch and the quality control and costs one panel row instead of two.
         int activeShadowSteps = (int)shadowSteps;
@@ -798,6 +935,18 @@ int main(int argc, char **argv)
 
         if (activeGeometry == GEOMETRY_DEPTH)
         {
+            if (liveDepthUsable)
+            {
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Camera FOV",
+                             TextFormat("%.0f deg", cameraFovDegrees),
+                             &cameraFovDegrees, 40.0f, 110.0f);
+                y += rowStep;
+            }
+            float beforeRelief = depthRelief;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Relief",
+                         TextFormat("%.2f", depthRelief), &depthRelief, 0.02f, 1.0f);
+            if (depthRelief != beforeRelief) reliefFollowsSource = false;
+            y += rowStep;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Depth taps",
                          TextFormat("%.0f", depthSpacing), &depthSpacing, 1.0f, 6.0f);
             y += rowStep;
@@ -807,10 +956,12 @@ int main(int argc, char **argv)
             y += rowStep;
             if (shadowSteps < 1.0f) GuiSetState(STATE_DISABLED);
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Thickness",
-                         TextFormat("%.2f m", shadowThickness), &shadowThickness, 0.05f, 1.20f);
+                         TextFormat("%.2f m", shadowThickness), &shadowThickness,
+                         sceneNear*0.1f, sceneNear*2.5f);
             y += rowStep;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Bias",
-                         TextFormat("%.0f mm", shadowBias*1000.0f), &shadowBias, 0.001f, 0.030f);
+                         TextFormat("%.0f mm", shadowBias*1000.0f), &shadowBias,
+                         sceneNear*0.002f, sceneNear*0.06f);
             y += rowStep;
             GuiSetState(STATE_NORMAL);
         }
@@ -830,7 +981,8 @@ int main(int argc, char **argv)
                      TextFormat("%.2f", light.intensity), &light.intensity, 0.0f, 6.0f);
         y += rowStep;
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Falloff",
-                     TextFormat("%.1f", light.falloff), &light.falloff, 0.0f, 30.0f);
+                     TextFormat("%.1f", activeFalloff),
+                     (activeGeometry == GEOMETRY_DEPTH) ? &depthFalloff : &light.falloff, 0.0f, 30.0f);
         y += rowStep;
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Ambient",
                      TextFormat("%.2f", light.ambient), &light.ambient, 0.0f, 1.0f);
@@ -846,11 +998,23 @@ int main(int argc, char **argv)
         // Same slider, different meaning: in depth mode it is the light's
         // distance from the camera in metres, so pushing it past the subject
         // is what puts the light behind them.
-        GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH },
-                     (activeGeometry == GEOMETRY_DEPTH) ? "Distance" : "Height",
-                     (activeGeometry == GEOMETRY_DEPTH) ? TextFormat("%.2f m", shownHeight)
-                                                        : TextFormat("%.2f", shownHeight),
-                     demoDrivesLook ? &shownHeight : &light.height, 0.02f, 1.5f);
+        if (activeGeometry == GEOMETRY_DEPTH)
+        {
+            // Metres, spanning the scene the depth source reports, so the
+            // light can always be put in front of, level with, or behind the
+            // subject whatever the scale.
+            float shownDistance = depthLightDistance;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Distance",
+                         TextFormat("%.2f m", shownDistance),
+                         demoDrivesLook ? &shownDistance : &depthLightDistance,
+                         0.05f, sceneFar*1.1f);
+        }
+        else
+        {
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Height",
+                         TextFormat("%.2f", shownHeight),
+                         demoDrivesLook ? &shownHeight : &light.height, 0.02f, 1.5f);
+        }
         GuiSetState(STATE_NORMAL);
         y += groupStep;
 
@@ -996,6 +1160,8 @@ int main(int argc, char **argv)
     if (webcamSystemReady) ShutdownWebcamSystem();
     UnloadShader(rs.shader);
     UnloadTexture(photoTexture);
+    ShutdownDepthModel();
+    if (liveDepth.id != 0) UnloadTexture(liveDepth);
     UnloadTexture(noDepth);
     UnloadSyntheticSource(&synthetic[0]);
     UnloadSyntheticSource(&synthetic[1]);

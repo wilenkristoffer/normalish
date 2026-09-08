@@ -18,8 +18,25 @@ uniform int geometryMode;
 
 uniform sampler2D depthMap;   // R channel: metres along the view axis, 0 = no data
 uniform float tanHalfFovX;    // tan of half the horizontal field of view
-uniform float depthSpacing;   // tap distance in texels for the depth gradient
-uniform vec2 depthRange;      // near/far, only for the depth view mode
+uniform float depthSpacing;   // tap distance in depth texels for the gradient
+// The depth map's own texel size, which is not the albedo's: the model returns
+// 518 wide against a 1280-wide frame. Tapping the gradient at albedo spacing
+// samples well inside a single depth texel, where the bilinear interpolation
+// is piecewise linear, and the normals then follow the interpolation grid
+// rather than the surface.
+uniform vec2 depthTexelSize;
+// How much of the measured surface tilt to keep, 1 = all of it. Exact depth
+// needs none of this, but a monocular model is trained for depth accuracy
+// rather than gradient accuracy: its surfaces undulate by centimetres, and at
+// room scale one depth texel spans only millimetres of scene, so a small
+// depth error becomes a large tilt. Attenuating the tilt trades some real
+// shape for normals that are not dominated by that error.
+uniform float depthRelief;
+uniform vec2 depthRange;      // near/far of the source, for the depth view
+// Distance at which falloff is measured, so one falloff setting means the
+// same thing whether the scene is a synthetic head at 0.6 m or a real room
+// running to 8 m. 1.0 in luminance mode, which leaves that model untouched.
+uniform float distanceScale;
 
 uniform int shadowSteps;        // 0 disables the shadow march
 uniform float shadowBias;       // metres; below this a surface shadows itself
@@ -110,7 +127,7 @@ vec3 normalFromDepth(vec2 uv)
     float z = depthAt(uv);
     if (z <= 0.0) return vec3(0.0, 0.0, -1.0);
 
-    vec2 d = texelSize*max(depthSpacing, 1.0);
+    vec2 d = depthTexelSize*max(depthSpacing, 1.0);
     vec3 P = depthPosition(uv);
 
     vec3 Px = axisDelta(uv, P, z, vec2(d.x, 0.0));
@@ -119,7 +136,13 @@ vec3 normalFromDepth(vec2 uv)
     vec3 n = cross(Py, Px);
     float len = length(n);
     if (len <= 1.0e-12) return vec3(0.0, 0.0, -1.0);
-    return n/len;
+    n /= len;
+
+    // Scaling the lateral components and renormalising rotates the normal
+    // toward the view axis without changing its direction in the image plane,
+    // so shape is softened rather than distorted.
+    n.xy *= depthRelief;
+    return normalize(n);
 }
 
 // The inverse of depthPosition: a camera-space point back to the pixel that
@@ -152,9 +175,11 @@ float shadowFactor(vec3 P, vec3 L, float lightDist)
 {
     if (shadowSteps <= 0) return 1.0;
 
-    // Two metres is past the far wall, and marching the whole way to a distant
-    // light would spend every step in empty space.
-    float span = min(lightDist, 2.0);
+    // Cap the march relative to the scene rather than at a fixed distance:
+    // four times the nearest surface reaches past the back wall in both a
+    // synthetic head scene and a real room, whereas a fixed two metres would
+    // cover only the first quarter of a room-scale ray.
+    float span = min(lightDist, distanceScale*4.0);
     float stepLen = span/float(shadowSteps);
     float jitter = hash12(gl_FragCoord.xy);
 
@@ -220,7 +245,8 @@ void main()
     vec3 L = toLight/max(dist, 0.0001);
     vec3 H = normalize(L + V);
 
-    float atten = lightIntensity/(1.0 + falloff*dist*dist);
+    float scaled = dist/max(distanceScale, 0.0001);
+    float atten = lightIntensity/(1.0 + falloff*scaled*scaled);
     float diffuse = max(dot(normal, L), 0.0)*atten;
     float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten;
 

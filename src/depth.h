@@ -31,6 +31,12 @@ typedef struct DepthFrame {
     int height;
     float tanHalfFovX;
     float *depth;
+    // The range the scene actually occupies. Everything downstream - the
+    // light's distance slider, the depth view's mapping, the falloff scale -
+    // is derived from these rather than from a hardcoded guess, because a
+    // synthetic head sits at 0.6 m and a real room runs to 8 m.
+    float nearMetres;
+    float farMetres;
 } DepthFrame;
 
 // Ground truth for a synthetic scene: the depth a real sensor would report,
