@@ -566,8 +566,15 @@ Consequences worth stating:
   camera-distance slider that sweeps the light from in front of the face to
   behind it. That single slider is the demo.
 - The viewer is no longer orthographic: `V = normalize(-P)`.
-- The luminance path must keep working unchanged when there is no depth map,
-  for photo mode and as a fallback.
+- **The flat/orthographic model stays as a user-selectable mode, not a
+  fallback.** Decided 2026-09-08: it works, it is the whole of what ships on
+  main, and it is the right choice for a still photo where there is no depth
+  to be had. So there is a "Geometry" setting with two modes - luminance
+  relief (flat, orthographic, exactly as main behaves today) and depth
+  (perspective) - and the luminance path is not to be touched beyond being
+  moved behind that switch.
+- This branch is experimental by agreement; main remains the fallback if the
+  result disappoints.
 
 ### Phase A - depth as a first-class input
 
