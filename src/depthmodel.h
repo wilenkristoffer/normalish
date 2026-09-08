@@ -36,9 +36,14 @@ const char *GetDepthModelStatus(void);
 void SubmitDepthFrame(const unsigned char *rgba, int width, int height);
 
 // The most recent depth map, cropped to the region the frame occupied so its
-// texture coordinates line up with the albedo. Returns false until the first
-// inference completes, and only reports true once per new result.
-bool TakeLatestDepth(const float **depth, int *width, int *height);
+// texture coordinates line up with the albedo, together with a mask of the
+// subject. Returns false until the first inference completes, and only
+// reports true once per new result.
+//
+// The buffers handed back are copies taken while the worker is locked out, so
+// they stay valid until the next call.
+bool TakeLatestDepth(const float **depth, const unsigned char **subjectMask,
+                     int *width, int *height);
 
 // Milliseconds for the last inference, for the panel read-out.
 float GetDepthInferenceMs(void);
@@ -47,5 +52,10 @@ float GetDepthInferenceMs(void);
 // raw min and max so one hot pixel cannot set the scale. False before the
 // first result.
 bool GetDepthRange(float *nearMetres, float *farMetres);
+
+// How deep a slice of the scene counts as the subject, in metres from the
+// nearest surface. Continuity alone cannot separate a person from the room
+// behind them, because the two are connected through the floor.
+void SetSubjectBand(float metres);
 
 #endif

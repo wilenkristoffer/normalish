@@ -850,11 +850,55 @@ artefacted, worst on a curtain at a grazing angle where the model's depth is
 least reliable. The artefacts are concentrated in exactly the part of the
 frame nobody wants relit.
 
-So the next step is **relight the subject, leave the room alone**: threshold
-the depth to the nearest coherent region and blend the original frame back in
-outside it. That is nearly free now that depth exists, it removes the worst
-of the artefacts by construction, it is what the effect is actually for in a
-call, and it retires the background masking deferred back in phase 4.
+#### D3 - relight the subject, leave the room alone (DONE)
+
+Blends back to the untouched frame outside a subject mask. The original
+pixels already carry the room's own lighting, so they are the honest fallback.
+This removes the worst artefacts by construction, is what the effect is for in
+a call, and retires the background masking deferred back in phase 4.
+
+Finding the subject took four attempts, and the first three are worth keeping
+because each failed for a different reason.
+
+1. **A depth cutoff.** Fails immediately: a curtain beside the camera is as
+   near as the person in front of it.
+2. **Growing a region from a seed**, the nearest pixel in the middle of the
+   frame. Picked the curtain, because a curtain edge reaches into the centre
+   third and is nearer than someone sitting off to one side. A single seed is
+   not a person detector.
+3. **Labelling depth-continuous regions and scoring them.** The winning region
+   swallowed the entire room. A person is depth-connected to their chair,
+   which connects to the floor, which runs smoothly to the far wall; adjacent
+   pixels on a receding surface differ by a millimetre or two, well inside any
+   sensible continuity tolerance, so nothing ever breaks the chain.
+4. **Continuity plus a depth band measured from each region's own nearest
+   point**, then scoring. This works.
+
+The band has to be per region. Anchoring one global band on the nearest pixel
+in the frame was tried and failed for a fourth reason: the nearest thing was
+the curtain at about 1.3 m, so a 0.9 m band ran to 2.2 m and excluded the
+person at 2.3 m altogether.
+
+Regions are scored for looking like a person in a webcam shot: near, a
+reasonable share of the frame with the reward saturating so a wall cannot win
+on size alone, running out of the bottom of frame, mildly central, and
+penalised heavily for covering most of the frame height at one side - which
+is the test that rejects curtains, walls and door frames.
+
+**Verified: 8.1% of the frame, a clean head-and-shoulders silhouette, with
+the curtain, bed and wall excluded.**
+
+**A method note that cost time.** Three of those attempts were judged from
+screenshots of the live camera, and the last of them was taken of an empty
+chair - which says nothing at all about a person detector. The fix was
+`--depth-image <in> <prefix>`, which runs the real code path over a saved
+frame and writes the depth and mask out. Same lesson as the virtual camera's
+purpose-built consumer: when a result depends on what is in front of the
+camera, stop testing against the camera.
+
+Controls: **Subject only** on by default, **Subject depth** for the band, and
+**Spill** to let some light reach beyond the subject when a hard cut looks
+wrong.
 
 #### Expectation to set now
 

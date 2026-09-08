@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "onnxruntime_c_api.h"
 #include "dml_provider_factory.h"
@@ -42,9 +43,21 @@ static bool pendingFull = false;
 // Published result, cropped to the letterbox region.
 static float *resultDepth = NULL;
 static float *smoothedDepth = NULL;
+static unsigned char *maskBuffer = NULL;
+static unsigned char *maskScratch = NULL;
+static int *growStack = NULL;
+static int *labelBuffer = NULL;
+// Copies handed to the caller, so the worker can carry on without the render
+// thread reading a buffer part way through being rewritten.
+static float *publishDepth = NULL;
+static unsigned char *publishMask = NULL;
 static int resultWidth = 0, resultHeight = 0;
 static bool resultFresh = false;
 static float resultNear = 0.0f, resultFar = 0.0f;
+// How deep a slice counts as the subject. A person plus the chair they are
+// sitting in is well under a metre; beyond that the growth starts reaching
+// the room behind them.
+static float subjectBand = 0.9f;
 static volatile LONG lastInferenceMicros = 0;
 
 static void SetStatus(const char *text)
@@ -65,6 +78,216 @@ static bool Failed(OrtStatus *status, const char *what)
     SetStatus(buffer);
     ort->ReleaseStatus(status);
     return true;
+}
+
+
+// Which pixels belong to the subject.
+//
+// A plain depth cutoff does not work: a curtain beside the camera is as near
+// as the person sitting in front of it. Neither does growing from a single
+// seed - the first attempt took the nearest pixel in the middle of the frame
+// and picked the curtain, because a curtain edge reaches into the centre and
+// is nearer than someone sitting off to one side.
+//
+// Depth continuity alone is not enough either. The second attempt labelled
+// depth-continuous regions and the winning region swallowed the whole room:
+// a person is depth-connected to their chair, which is connected to the
+// floor, which runs smoothly to the far wall, so nothing ever breaks the
+// chain. Adjacent pixels on a receding surface differ by a millimetre or two,
+// well inside any sensible continuity tolerance.
+//
+// What works is continuity *plus* a depth band, measured from each region's
+// own nearest point. A single global band anchored on the nearest pixel in
+// the frame does not work either: the third attempt did that, and since the
+// nearest thing was a curtain beside the camera, the band ran from the
+// curtain and excluded the person standing further back entirely.
+//
+// Per region, the band stops growth crawling off to the wall, and anything
+// else near the camera becomes its own region rather than joining the
+// subject.
+//
+// Regions are then scored for looking like a person in a webcam shot: near,
+// reasonably large, running out of the bottom of frame, and not a slab
+// covering the full height at one side. That last test rejects curtains.
+//
+// Runs at the depth map's own resolution, about 150k pixels, so it is cheap
+// enough to redo on every inference.
+
+typedef struct Region {
+    int area;
+    double sumDepth;
+    double sumX;
+    int leftEdge;      // pixels in the first column
+    int rightEdge;     // pixels in the last column
+    bool touchesBottom;
+} Region;
+
+#define MAX_REGIONS 512
+
+static void ComputeSubjectMask(int w, int h, float bandMetres)
+{
+    size_t count = (size_t)w*h;
+
+    if (maskBuffer == NULL) maskBuffer = (unsigned char *)malloc(count);
+    if (maskScratch == NULL) maskScratch = (unsigned char *)malloc(count);
+    if (growStack == NULL) growStack = (int *)malloc(count*sizeof(int));
+    if (labelBuffer == NULL) labelBuffer = (int *)malloc(count*sizeof(int));
+    if ((maskBuffer == NULL) || (maskScratch == NULL) ||
+        (growStack == NULL) || (labelBuffer == NULL)) return;
+
+    for (size_t i = 0; i < count; i++) labelBuffer[i] = -1;
+
+    Region regions[MAX_REGIONS];
+    int regionCount = 0;
+
+    const int dx[4] = { -1, 1, 0, 0 };
+    const int dy[4] = { 0, 0, -1, 1 };
+
+    for (size_t start = 0; start < count; start++)
+    {
+        if (labelBuffer[start] != -1) continue;
+        if (smoothedDepth[start] <= 0.0f) { labelBuffer[start] = -2; continue; }
+        if (regionCount >= MAX_REGIONS) break;
+
+        int label = regionCount++;
+        Region *r = &regions[label];
+        memset(r, 0, sizeof(*r));
+
+        int top = 0;
+        growStack[top++] = (int)start;
+        labelBuffer[start] = label;
+
+        // The band is measured from the nearest point found so far in this
+        // region. It only ever loosens as growth finds nearer pixels, and
+        // because the continuity rule keeps neighbours within centimetres the
+        // frontier depth moves slowly enough for that to be stable.
+        float regionMin = smoothedDepth[start];
+
+        while (top > 0)
+        {
+            int index = growStack[--top];
+            int cx = index%w;
+            int cy = index/w;
+            float here = smoothedDepth[index];
+
+            if (here < regionMin) regionMin = here;
+
+            r->area++;
+            r->sumDepth += here;
+            r->sumX += cx;
+            if (cx == 0) r->leftEdge++;
+            if (cx == w - 1) r->rightEdge++;
+            if (cy == h - 1) r->touchesBottom = true;
+
+            // Tolerance grows with distance: the model is proportionally less
+            // precise further away, so a fixed figure would either fragment
+            // the far side of the subject or leak into the room on the near
+            // side.
+            float tolerance = 0.02f*here + 0.01f;
+
+            for (int k = 0; k < 4; k++)
+            {
+                int nx = cx + dx[k];
+                int ny = cy + dy[k];
+                if ((nx < 0) || (ny < 0) || (nx >= w) || (ny >= h)) continue;
+
+                size_t n = (size_t)ny*w + nx;
+                if (labelBuffer[n] != -1) continue;
+
+                float there = smoothedDepth[n];
+                if (there <= 0.0f) { labelBuffer[n] = -2; continue; }
+                // Left unlabelled rather than marked dead: a pixel beyond this
+                // region's band belongs to something else, and has to stay
+                // available to seed its own region.
+                if (there > regionMin + bandMetres) continue;
+                if (fabsf(there - here) > tolerance) continue;
+
+                labelBuffer[n] = label;
+                growStack[top++] = (int)n;
+            }
+        }
+    }
+
+    int best = -1;
+    double bestScore = 0.0;
+
+    for (int i = 0; i < regionCount; i++)
+    {
+        Region *r = &regions[i];
+        // Ignore specks. A person can be a modest share of the frame once the
+        // background has been gated away, so this is deliberately low.
+        if (r->area < (int)(count/200)) continue;
+
+        double meanDepth = r->sumDepth/(double)r->area;
+        if (meanDepth <= 0.0) continue;
+
+        // Nearer is better, and the near end of the scene sets the reference
+        // so this does not depend on the room's absolute size.
+        double proximity = (resultNear > 0.0f) ? ((double)resultNear/meanDepth) : 1.0;
+
+        // Saturating, so a region being enormous is not itself a virtue -
+        // that is how a wall would win.
+        double areaFactor = (double)r->area/(0.03*(double)count);
+        if (areaFactor > 1.0) areaFactor = 1.0;
+
+        // A seated person runs out of the bottom of frame; a lamp does not.
+        double bottom = r->touchesBottom ? 1.0 : 0.35;
+
+        // A slab covering most of the frame height at one side is a curtain,
+        // a wall or a door frame. This is the test that rejects them.
+        int sideRun = (r->leftEdge > r->rightEdge) ? r->leftEdge : r->rightEdge;
+        double side = (sideRun > (int)(0.8*h)) ? 0.2 : 1.0;
+
+        // Mild preference for the middle, since the subject is roughly framed.
+        double centreOffset = fabs((r->sumX/(double)r->area)/(double)w - 0.5)*2.0;
+        double centre = 1.0 - 0.45*centreOffset;
+
+        double score = proximity*areaFactor*bottom*side*centre;
+        if (score > bestScore) { bestScore = score; best = i; }
+    }
+
+    memset(maskBuffer, 0, count);
+    if (best < 0) return;
+    for (size_t i = 0; i < count; i++)
+        if (labelBuffer[i] == best) maskBuffer[i] = 255;
+
+    // Feather the edge. A hard boundary between relit and original pixels
+    // reads as a cut-out; two separable box passes here become a soft band
+    // once the mask is upsampled to the frame.
+    const int radius = 3;
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int sum = 0, n = 0;
+                for (int k = -radius; k <= radius; k++)
+                {
+                    int sx = x + k;
+                    if ((sx < 0) || (sx >= w)) continue;
+                    sum += maskBuffer[(size_t)y*w + sx];
+                    n++;
+                }
+                maskScratch[(size_t)y*w + x] = (unsigned char)(sum/n);
+            }
+        }
+        for (int x = 0; x < w; x++)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                int sum = 0, n = 0;
+                for (int k = -radius; k <= radius; k++)
+                {
+                    int sy = y + k;
+                    if ((sy < 0) || (sy >= h)) continue;
+                    sum += maskScratch[(size_t)sy*w + x];
+                    n++;
+                }
+                maskBuffer[(size_t)y*w + x] = (unsigned char)(sum/n);
+            }
+        }
+    }
 }
 
 // One inference. Runs only on the worker thread.
@@ -106,6 +329,13 @@ static void RunInference(const float *input, int cropX, int cropY, int cropW, in
         {
             free(resultDepth);
             free(smoothedDepth);
+            free(maskBuffer); maskBuffer = NULL;
+            free(maskScratch); maskScratch = NULL;
+            free(growStack); growStack = NULL;
+    free(labelBuffer); labelBuffer = NULL;
+            free(labelBuffer); labelBuffer = NULL;
+            free(publishDepth); publishDepth = NULL;
+            free(publishMask); publishMask = NULL;
             resultDepth = (float *)malloc((size_t)cropW*cropH*sizeof(float));
             smoothedDepth = NULL;      // a resize invalidates the history
             resultWidth = cropW;
@@ -183,6 +413,8 @@ static void RunInference(const float *input, int cropX, int cropY, int cropW, in
                 resultNear = lo + span*(float)lowBin/(float)(BINS - 1);
                 resultFar = lo + span*(float)highBin/(float)(BINS - 1);
             }
+
+            ComputeSubjectMask(cropW, cropH, subjectBand);
 
             resultFresh = true;
         }
@@ -342,6 +574,15 @@ void SubmitDepthFrame(const unsigned char *rgba, int width, int height)
     SetEvent(frameReady);
 }
 
+void SetSubjectBand(float metres)
+{
+    if (metres < 0.1f) metres = 0.1f;
+    if (metres > 4.0f) metres = 4.0f;
+    EnterCriticalSection(&lock);
+    subjectBand = metres;
+    LeaveCriticalSection(&lock);
+}
+
 bool GetDepthRange(float *nearMetres, float *farMetres)
 {
     if (!ready) return false;
@@ -352,18 +593,33 @@ bool GetDepthRange(float *nearMetres, float *farMetres)
     return have;
 }
 
-bool TakeLatestDepth(const float **depth, int *width, int *height)
+bool TakeLatestDepth(const float **depth, const unsigned char **subjectMask,
+                     int *width, int *height)
 {
     if (!ready) return false;
 
     EnterCriticalSection(&lock);
-    bool fresh = resultFresh && (smoothedDepth != NULL);
+    bool fresh = resultFresh && (smoothedDepth != NULL) && (maskBuffer != NULL);
     if (fresh)
     {
-        *depth = smoothedDepth;
-        *width = resultWidth;
-        *height = resultHeight;
-        resultFresh = false;
+        size_t count = (size_t)resultWidth*resultHeight;
+        if (publishDepth == NULL) publishDepth = (float *)malloc(count*sizeof(float));
+        if (publishMask == NULL) publishMask = (unsigned char *)malloc(count);
+
+        if ((publishDepth != NULL) && (publishMask != NULL))
+        {
+            // Copied under the lock rather than handing out the live buffers,
+            // so the worker's next result cannot overwrite what the render
+            // thread is uploading to the GPU.
+            memcpy(publishDepth, smoothedDepth, count*sizeof(float));
+            memcpy(publishMask, maskBuffer, count);
+            *depth = publishDepth;
+            *subjectMask = publishMask;
+            *width = resultWidth;
+            *height = resultHeight;
+            resultFresh = false;
+        }
+        else fresh = false;
     }
     LeaveCriticalSection(&lock);
     return fresh;
@@ -392,5 +648,10 @@ void ShutdownDepthModel(void)
     free(pendingInput); pendingInput = NULL;
     free(resultDepth); resultDepth = NULL;
     free(smoothedDepth); smoothedDepth = NULL;
+    free(maskBuffer); maskBuffer = NULL;
+    free(maskScratch); maskScratch = NULL;
+    free(growStack); growStack = NULL;
+    free(publishDepth); publishDepth = NULL;
+    free(publishMask); publishMask = NULL;
     ready = false;
 }

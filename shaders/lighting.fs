@@ -32,6 +32,14 @@ uniform vec2 depthTexelSize;
 // depth error becomes a large tilt. Attenuating the tilt trades some real
 // shape for normals that are not dominated by that error.
 uniform float depthRelief;
+
+// Which pixels are the subject, so the room behind them can be left alone.
+// Relighting the whole frame means relighting curtains and furniture, where
+// the depth model is least reliable and where the artefacts are worst - and
+// nobody wanted those relit anyway.
+uniform sampler2D subjectMask;
+uniform int maskEnabled;      // 0 relights everything, as before
+uniform float maskStrength;   // how far outside the subject the light reaches
 uniform vec2 depthRange;      // near/far of the source, for the depth view
 // Distance at which falloff is measured, so one falloff setting means the
 // same thing whether the scene is a synthetic head at 0.6 m or a real room
@@ -51,7 +59,7 @@ uniform float ambient;
 uniform float specularStrength;
 uniform float shininess;
 uniform float aspect;
-uniform int viewMode;    // 0 = lit, 1 = normals, 2 = albedo only, 3 = depth
+uniform int viewMode;    // 0 = lit, 1 = normals, 2 = albedo, 3 = depth, 4 = mask
 
 out vec4 finalColor;
 
@@ -262,7 +270,21 @@ void main()
 
     vec3 color = albedo*(ambient + diffuse*lightColor) + specular*lightColor;
 
-    if (viewMode == 1) color = normal*0.5 + 0.5;
+    // Blend back to the untouched frame outside the subject. The original
+    // pixels already carry the room's own lighting, so they are the honest
+    // thing to fall back to.
+    if ((geometryMode == 1) && (maskEnabled == 1))
+    {
+        float subject = texture(subjectMask, fragTexCoord).r;
+        color = mix(albedo, color, clamp(subject + maskStrength, 0.0, 1.0));
+    }
+
+    if (viewMode == 4)
+    {
+        float subject = texture(subjectMask, fragTexCoord).r;
+        color = mix(albedo*0.25, vec3(0.2, 1.0, 0.3), subject*0.75);
+    }
+    else if (viewMode == 1) color = normal*0.5 + 0.5;
     else if (viewMode == 2) color = albedo;
     else if (viewMode == 3)
     {

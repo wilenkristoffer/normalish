@@ -160,6 +160,34 @@ and likewise for streams.
   compilation and allocation. Time a warm-up run separately or the numbers
   are wrong.
 
+## Depth maps
+
+- **Normals from a monocular depth model are dominated by the model's own
+  error.** At 2.5 m a 518-wide depth map spans roughly 7 mm of scene per
+  texel, so a 5 mm depth error between neighbours tilts a normal by 36
+  degrees. These models are trained for depth accuracy, not gradient
+  accuracy, and their surfaces undulate by centimetres. Attenuating the tilt
+  (scale the normal's lateral components, renormalise) is what works.
+- **Widening the gradient taps makes that worse, not better**, because the
+  error is low-frequency: it converts fine noise into large blobs.
+- **Take the gradient at the depth map's own texel size**, not the colour
+  image's. Sampling inside a single depth texel reads the bilinear
+  interpolation, and the normals then follow the interpolation grid.
+- **Nothing may assume a scene's scale.** A synthetic subject at 0.6 m and a
+  real room running to 8 m break every hardcoded range - light distance,
+  shadow thickness, shadow bias, march span, view mapping, slider bounds.
+  Derive them from the depth source's own reported range, and measure falloff
+  relative to the nearest surface so one setting travels between scenes.
+- **Segmenting a person out of a depth map needs continuity plus an absolute
+  band, and the band must be per region.** Continuity alone connects a person
+  through their chair and the floor to the far wall. One global band anchored
+  on the frame's nearest pixel fails whenever something else is nearer than
+  the subject.
+- **A single seed is not a person detector.** Label candidate regions and
+  score them; the test that does the most work is penalising a region that
+  covers most of the frame height at one side, which is what a curtain, wall
+  or door frame looks like.
+
 ## Build
 
 - **`UNICODE`/`_UNICODE` must be defined** for code written against a Visual

@@ -61,6 +61,9 @@ typedef struct RelightShader {
     int distanceScaleLoc;
     int depthTexelSizeLoc;
     int depthReliefLoc;
+    int subjectMaskLoc;
+    int maskEnabledLoc;
+    int maskStrengthLoc;
     int shadowStepsLoc;
     int shadowBiasLoc;
     int shadowThicknessLoc;
@@ -100,6 +103,9 @@ static RelightShader LoadRelightShader(void)
     r.distanceScaleLoc = GetShaderLocation(r.shader, "distanceScale");
     r.depthTexelSizeLoc = GetShaderLocation(r.shader, "depthTexelSize");
     r.depthReliefLoc = GetShaderLocation(r.shader, "depthRelief");
+    r.subjectMaskLoc = GetShaderLocation(r.shader, "subjectMask");
+    r.maskEnabledLoc = GetShaderLocation(r.shader, "maskEnabled");
+    r.maskStrengthLoc = GetShaderLocation(r.shader, "maskStrength");
     r.shadowStepsLoc = GetShaderLocation(r.shader, "shadowSteps");
     r.shadowBiasLoc = GetShaderLocation(r.shader, "shadowBias");
     r.shadowThicknessLoc = GetShaderLocation(r.shader, "shadowThickness");
@@ -296,6 +302,8 @@ static int VerifyNormals(RelightShader rs, DepthScene which, int width, int heig
     SetShaderValue(rs.shader, rs.distanceScaleLoc, &verifyScale, SHADER_UNIFORM_FLOAT);
     // Ground truth is the unattenuated surface, so keep all of the tilt.
     SetShaderValue(rs.shader, rs.depthReliefLoc, &verifyScale, SHADER_UNIFORM_FLOAT);
+    int verifyMask = 0;
+    SetShaderValue(rs.shader, rs.maskEnabledLoc, &verifyMask, SHADER_UNIFORM_INT);
 
     Rectangle whole = { 0.0f, 0.0f, (float)width, (float)height };
 
@@ -391,10 +399,89 @@ static int VerifyNormals(RelightShader rs, DepthScene which, int width, int heig
     return pass ? 0 : 1;
 }
 
+
+// Runs the depth model over one saved image and writes out what it produced.
+//
+// This exists because the subject mask cannot be judged against a live camera:
+// three attempts at it were assessed from screenshots, and the last one was
+// taken of an empty chair, which says nothing about a person detector. A fixed
+// frame makes the check repeatable, and it runs the same code path the app
+// does rather than a parallel copy of it.
+static int RunDepthOnImage(const char *path, const char *outPrefix)
+{
+    if (!InitDepthModel())
+    {
+        printf("DEPTH-IMAGE: %s\n", GetDepthModelStatus());
+        return 1;
+    }
+
+    Image frame = LoadImage(path);
+    if (frame.data == NULL)
+    {
+        printf("DEPTH-IMAGE: could not load %s\n", path);
+        return 1;
+    }
+    ImageFormat(&frame, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    printf("DEPTH-IMAGE: %s  %dx%d\n", path, frame.width, frame.height);
+
+    SubmitDepthFrame((const unsigned char *)frame.data, frame.width, frame.height);
+
+    const float *depth = NULL;
+    const unsigned char *mask = NULL;
+    int w = 0, h = 0;
+    bool got = false;
+    for (int wait = 0; (wait < 200) && !got; wait++)
+    {
+        got = TakeLatestDepth(&depth, &mask, &w, &h);
+        if (!got) WaitTime(0.02);
+    }
+    if (!got)
+    {
+        printf("DEPTH-IMAGE: no result\n");
+        return 1;
+    }
+
+    float near = 0.0f, far = 0.0f;
+    GetDepthRange(&near, &far);
+    printf("  depth map  : %dx%d\n", w, h);
+    printf("  range      : %.3f to %.3f m (robust)\n", near, far);
+    printf("  inference  : %.1f ms\n", GetDepthInferenceMs());
+
+    size_t count = (size_t)w*h;
+    long long covered = 0;
+    for (size_t i = 0; i < count; i++) if (mask[i] > 127) covered++;
+    printf("  mask       : %.1f%% of the frame\n", 100.0*(double)covered/(double)count);
+
+    // Near is white, so the visualisation matches the in-app depth view.
+    unsigned char *grey = (unsigned char *)RL_MALLOC(count);
+    for (size_t i = 0; i < count; i++)
+    {
+        float t = (depth[i] - near)/((far > near) ? (far - near) : 1.0f);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        grey[i] = (unsigned char)((1.0f - t)*255.0f);
+    }
+
+    Image depthImage = { .data = grey, .width = w, .height = h, .mipmaps = 1,
+                         .format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE };
+    Image maskImage = { .data = (void *)mask, .width = w, .height = h, .mipmaps = 1,
+                        .format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE };
+
+    ExportImage(depthImage, TextFormat("%s-depth.png", outPrefix));
+    ExportImage(maskImage, TextFormat("%s-mask.png", outPrefix));
+    printf("  wrote      : %s-depth.png, %s-mask.png\n", outPrefix, outPrefix);
+
+    RL_FREE(grey);
+    UnloadImage(frame);
+    ShutdownDepthModel();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     // A leading flag is not a photo path.
     bool verifyOnly = (argc > 1) && (TextIsEqual(argv[1], "--verify-normals"));
+    bool depthImageOnly = (argc > 3) && (TextIsEqual(argv[1], "--depth-image"));
     const char *photoPath = ((argc > 1) && (argv[1][0] != '-')) ? argv[1]
                                                                 : ASSET_DIR "/portrait.png";
 
@@ -430,6 +517,14 @@ int main(int argc, char **argv)
     SetTextureFilter(photoTexture, TEXTURE_FILTER_BILINEAR);
 
     RelightShader rs = LoadRelightShader();
+
+    if (depthImageOnly)
+    {
+        int result = RunDepthOnImage(argv[2], argv[3]);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return result;
+    }
 
     if (verifyOnly)
     {
@@ -537,6 +632,12 @@ int main(int argc, char **argv)
     bool depthModelReady = InitDepthModel();
     TraceLog(LOG_INFO, "DEPTH: model %s", GetDepthModelStatus());
     Texture2D liveDepth = { 0 };
+    Texture2D liveMask = { 0 };
+    // On by default: relighting the background is what produced the worst
+    // artefacts, and it is not what the effect is for.
+    bool subjectOnly = true;
+    float maskStrength = 0.0f;
+    float subjectBand = 0.9f;
     int liveDepthW = 0, liveDepthH = 0;
     bool haveLiveDepth = false;
     // A webcam's horizontal field of view is not something we can query, and
@@ -588,6 +689,7 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_TWO)) viewMode = 1;
         if (IsKeyPressed(KEY_THREE)) viewMode = 2;
         if (IsKeyPressed(KEY_FOUR)) viewMode = 3;
+        if (IsKeyPressed(KEY_FIVE)) viewMode = 4;
 
         if (webcamReady && UpdateWebcamFrame((unsigned char *)webcamFrame.data))
         {
@@ -606,17 +708,29 @@ int main(int argc, char **argv)
         if (depthModelReady)
         {
             const float *fresh = NULL;
+            const unsigned char *freshMask = NULL;
             int freshW = 0, freshH = 0;
-            if (TakeLatestDepth(&fresh, &freshW, &freshH))
+            if (TakeLatestDepth(&fresh, &freshMask, &freshW, &freshH))
             {
                 if ((freshW != liveDepthW) || (freshH != liveDepthH))
                 {
                     if (liveDepth.id != 0) UnloadTexture(liveDepth);
+    if (liveMask.id != 0) UnloadTexture(liveMask);
                     Image image = {
                         .data = (void *)fresh, .width = freshW, .height = freshH,
                         .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R32
                     };
                     liveDepth = LoadTextureFromImage(image);
+                    if (liveMask.id != 0) UnloadTexture(liveMask);
+                    Image maskImage = {
+                        .data = (void *)freshMask, .width = freshW, .height = freshH,
+                        .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE
+                    };
+                    liveMask = LoadTextureFromImage(maskImage);
+                    // Bilinear, and deliberately: the upsample from 518 wide
+                    // to the frame is what turns the feathered mask into a
+                    // smooth edge rather than a stair-stepped one.
+                    SetTextureFilter(liveMask, TEXTURE_FILTER_BILINEAR);
                     // Bilinear here, unlike the synthetic scenes: this map is
                     // 518 wide against a 1280-wide frame, and point sampling
                     // that far upscaled is visibly blocky. It does soften
@@ -625,7 +739,11 @@ int main(int argc, char **argv)
                     liveDepthW = freshW;
                     liveDepthH = freshH;
                 }
-                else UpdateTexture(liveDepth, fresh);
+                else
+                {
+                    UpdateTexture(liveDepth, fresh);
+                    UpdateTexture(liveMask, freshMask);
+                }
                 haveLiveDepth = (liveDepth.id != 0);
             }
         }
@@ -827,6 +945,10 @@ int main(int argc, char **argv)
         float depthTexel[2] = { 1.0f/(float)activeDepth.width, 1.0f/(float)activeDepth.height };
         SetShaderValue(rs.shader, rs.depthTexelSizeLoc, depthTexel, SHADER_UNIFORM_VEC2);
         SetShaderValue(rs.shader, rs.depthReliefLoc, &depthRelief, SHADER_UNIFORM_FLOAT);
+        // Only the live source has a mask; a synthetic scene is all subject.
+        int maskEnabled = (liveDepthUsable && subjectOnly) ? 1 : 0;
+        SetShaderValue(rs.shader, rs.maskEnabledLoc, &maskEnabled, SHADER_UNIFORM_INT);
+        SetShaderValue(rs.shader, rs.maskStrengthLoc, &maskStrength, SHADER_UNIFORM_FLOAT);
         // Zero steps is how shadows are turned off, so the slider is both the
         // switch and the quality control and costs one panel row instead of two.
         int activeShadowSteps = (int)shadowSteps;
@@ -852,6 +974,8 @@ int main(int argc, char **argv)
             // batch and rlDrawRenderBatch clears the registered auxiliary
             // texture units, so an earlier binding is silently discarded.
             SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
+            SetShaderValueTexture(rs.shader, rs.subjectMaskLoc,
+                                  (liveMask.id != 0) ? liveMask : noDepth);
             DrawTexturePro(albedoTexture, cameraSource, cameraQuad, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
             EndShaderMode();
             EndTextureMode();
@@ -882,6 +1006,8 @@ int main(int argc, char **argv)
 
         BeginShaderMode(rs.shader);
         SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
+        SetShaderValueTexture(rs.shader, rs.subjectMaskLoc,
+                              (liveMask.id != 0) ? liveMask : noDepth);
         Rectangle albedoSource = { 0.0f, 0.0f, (float)albedoTexture.width, (float)albedoTexture.height };
         // Mirroring the live feed makes it behave like a mirror, which is what
         // you want when you are the subject.
@@ -937,6 +1063,18 @@ int main(int argc, char **argv)
         {
             if (liveDepthUsable)
             {
+                GuiCheckBox((Rectangle){ labelX, y, rowH, rowH }, "Subject only", &subjectOnly);
+                y += rowStep;
+                if (!subjectOnly) GuiSetState(STATE_DISABLED);
+                float beforeBand = subjectBand;
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Subject depth",
+                             TextFormat("%.2f m", subjectBand), &subjectBand, 0.2f, 3.0f);
+                if (subjectBand != beforeBand) SetSubjectBand(subjectBand);
+                y += rowStep;
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Spill",
+                             TextFormat("%.2f", maskStrength), &maskStrength, 0.0f, 1.0f);
+                GuiSetState(STATE_NORMAL);
+                y += rowStep;
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Camera FOV",
                              TextFormat("%.0f deg", cameraFovDegrees),
                              &cameraFovDegrees, 40.0f, 110.0f);
@@ -1113,9 +1251,10 @@ int main(int argc, char **argv)
         }
 
         GuiLabel((Rectangle){ labelX, screenH - 52.0f*uiScale, labelW, rowH },
-                 TextFormat("1/2/3/4 view (%s)   R reload",
+                 TextFormat("1-5 view (%s)   R reload",
                             (viewMode == 0) ? "lit" : ((viewMode == 1) ? "normals"
-                          : ((viewMode == 2) ? "albedo" : "depth"))));
+                          : ((viewMode == 2) ? "albedo"
+                          : ((viewMode == 3) ? "depth" : "subject")))));
         DrawText(TextFormat("%i FPS", GetFPS()), (int)labelX, (int)(screenH - 30.0f*uiScale),
                  (int)(14.0f*uiScale), GREEN);
 
