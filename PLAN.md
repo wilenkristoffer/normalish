@@ -742,16 +742,53 @@ Deliverable: a console tool that loads a saved webcam frame, runs the model,
 prints min/max/centre depth in metres and the per-frame latency, and writes
 the depth out as an image to look at. Nothing else.
 
+**Result (DONE) - all four answers are favourable.**
+
+1. ONNX Runtime 1.24.4 DirectML builds and links against its C API with
+   nothing but `onnxruntime.lib`. Needed pieces: the DirectML EP package
+   depends on `Microsoft.AI.DirectML` 1.15.4, whose `DirectML.dll` must sit
+   beside `onnxruntime.dll` - the copy in System32 is not guaranteed to be
+   new enough. Both are NuGet zips, so FetchContent can pull them.
+2. `DirectML : enabled on adapter 0` on the RX 7800 XT, no vendor anything.
+3. **22 ms per inference, best 22.0, worst 23.3, stable across runs.** About
+   44 fps if it were the only cost, against a 40 ms cold first run that pays
+   for shader compilation. This is far better than assumed and it collapses
+   the architecture worry: a worker thread at 30 Hz is comfortable, and the
+   elaborate decoupling contemplated below is not needed.
+4. Output is `[1,518,518]`, names `pixel_values` / `predicted_depth`, and the
+   values really are metres. On the portrait asset: 1.35 to 2.96 m, centre
+   1.81. On a real frame of the room: 1.86 to 7.91 m, with the doorway down
+   the middle reading 7.5 m and the subject the nearest thing in frame. Both
+   plausible.
+
+Quality is better than the risk note below feared. On the portrait the nose
+protrudes, the eye sockets are recessed, the ears sit at the right depth and
+the silhouette is crisp, with only a modest halo at the boundary. On the room
+frame the subject separates cleanly from the bed, the curtain and the
+corridor behind.
+
+**One new finding, which is the thing to watch in D2.** In a room-scale
+frame the depth range is dominated by the background - 1.9 to 7.9 m - so the
+subject's own 20 cm of relief is a small fraction of it, and the face reads
+as a nearly flat blob in a normalised visualisation. That may be harmless,
+because the shader takes normals from the *metric* gradient rather than from
+a normalised range, so face relief should survive regardless of what the
+background does. But if the model's effective precision in that regime is
+coarse, the facial normals will be noisy, and the fix is filtering or a
+gradient boost. Test it early in D2 rather than discovering it at the end.
+
+**The real cost, stated plainly:** about 27 MB of binaries (onnxruntime.dll
+17 MB, DirectML.dll 10 MB) plus a 99 MB model file.
+
 #### D2 - integration, shaped by what D1 measures
 
 - **Inference on a worker thread, not the render loop.** The existing webcam
   capture already establishes the pattern, and for the same reason: a
   synchronous call that takes tens of milliseconds would drag 60 FPS down to
   the model's rate.
-- **Depth does not need 60 Hz.** A head is mostly still, so depth can update
-  at 10-15 Hz and be interpolated, while relighting stays at 60. That
-  decouples the cost from the frame rate and is the reason this can work at
-  all if D1 comes back slow.
+- **Depth does not need 60 Hz**, and after D1 it does not need to be clever
+  either. 22 ms means a worker thread can run at 30 Hz and the renderer stays
+  at 60 regardless; no interpolation scheme is required.
 - **Letterbox, do not squash.** Resizing 16:9 into a square input distorts
   the geometry against the real camera, and the depth would then be
   misaligned with the albedo. Pad to square, run, crop back.

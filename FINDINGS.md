@@ -137,6 +137,29 @@ most-derived interface makes QI for its bases fail with `E_NOINTERFACE`. Use
 `ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>`
 and likewise for streams.
 
+## ONNX Runtime
+
+- **The DirectML provider needs `DirectML.dll` shipped alongside
+  `onnxruntime.dll`.** The `Microsoft.ML.OnnxRuntime.DirectML` NuGet package
+  does not contain it; it declares a dependency on `Microsoft.AI.DirectML`
+  instead. Windows does ship a `DirectML.dll` in System32, but not
+  necessarily the version ONNX Runtime was built against.
+- **NuGet packages are plain zips**, fetchable by URL from
+  `nuget.org/api/v2/package/<id>/<version>`, so CMake FetchContent can pull
+  them without nuget.exe - which is not installed here.
+- The C API needs only `onnxruntime.lib` to link; the DirectML provider is
+  selected with `OrtSessionOptionsAppendExecutionProvider_DML` from
+  `dml_provider_factory.h`.
+- **The DirectML provider requires `DisableMemPattern` and
+  `ORT_SEQUENTIAL` execution mode**, both set on the session options before
+  the session is created.
+- `CreateSession` takes `ORTCHAR_T*`, which is `wchar_t*` on Windows.
+- Read input and output names off the model with `SessionGetInputName` and
+  `SessionGetOutputName` rather than hardcoding them.
+- **The first inference costs roughly double**, paying for shader
+  compilation and allocation. Time a warm-up run separately or the numbers
+  are wrong.
+
 ## Build
 
 - **`UNICODE`/`_UNICODE` must be defined** for code written against a Visual
