@@ -532,7 +532,7 @@ headset and link box on the desk.
 | Synchronised dual-lens UVC module | Good | ~$78, one device, hardware-synced, side-by-side in one stream | Best if hardware is acceptable; drops into the existing device dropdown |
 | Two matched webcams | Good | Two devices, unsynchronised, manual mounting | Fallback |
 | Photometric stereo off the monitor | Real measured normals plus separated albedo, no hardware, no dependency | One-second calibration flash, still subject, dim-ish room | Rejected for now: the user needs the single monitor for other things |
-| ML monocular depth (MiDaS / Depth Anything via ONNX Runtime C API) | Best, live, per-frame, no ritual | One DLL plus a model file; needs a rule exception | Strongest fit given the constraints |
+| ML monocular depth (Depth Anything V2 via ONNX Runtime C API) | Best, live, per-frame, no ritual | One DLL plus a model file; needs a rule exception | **CHOSEN 2026-09-08** - see phase D |
 | Depth from defocus | - | - | Physically impossible: webcam depth of field at 600mm is far too deep |
 | Structure from motion | - | - | Sitting still gives no baseline, and a moving face breaks the rigid-scene assumption |
 
@@ -694,10 +694,88 @@ Two things had to be fixed after looking at it:
 Shadow bias is exposed as a control rather than fixed, because it is the
 parameter most likely to need tuning once depth is noisy rather than exact.
 
-### Phase D - choose a depth source
+### Phase D - depth from the webcam, by monocular estimation
 
-Only after seeing phases B and C. The table above is the shortlist, and the
-renderer will not care which is chosen.
+Decided 2026-09-08. Of the shortlist above, this is the only option that
+produces the subject's own geometry using hardware already on the desk, with
+no second camera, no calibration, no capture ritual and no dim room. The
+price is one dependency.
+
+**Second scoped exception to the C-and-raylib rule**, alongside the vcam DLL.
+ONNX Runtime is reached through its **C** API, so no C++ enters normalish
+itself, but it is a real third-party binary plus a model file. Recorded here
+so it is a decision and not a drift.
+
+**Model: Depth-Anything-V2-Metric-Hypersim-Small.** Apache-2.0, and the
+*metric* variant matters more than it sounds: it outputs depth in **metres**
+(indoor-tuned, 0-20 m) rather than the relative inverse depth the base models
+produce. Our renderer already works in metres in camera space, so this drops
+in without inventing a mapping from a unitless disparity to a distance.
+Input is 1x3x518x518, ImageNet normalisation.
+
+**Runtime: ONNX Runtime with the DirectML execution provider.** DirectML is
+DX12, so it accelerates on the RX 7800 XT with no vendor-specific anything -
+CUDA is not an option here. The DML EP is selected from the C API through
+`dml_provider_factory.h`. Prebuilt DML builds ship as NuGet packages, which
+are plain zips, so CMake FetchContent can pull one the same way WIL is
+pulled; that route is already proven from fetching VCamSample's packages by
+hand.
+
+**The model file must not be committed.** It is tens of MB and does not
+belong in a public repo whatever its licence. It gets downloaded on demand
+into `C:\ProgramData\normalish\`, and depth mode stays unavailable with a
+reason until it is present - the same shape as the virtual camera's
+registration step.
+
+#### D1 - spike, before any integration
+
+The risky questions are all unknowns, so answer them in a throwaway harness
+that does not touch normalish:
+
+1. Does ONNX Runtime DirectML build and link from FetchContent?
+2. Does the model actually run on this GPU?
+3. **How long does one inference take?** This decides the whole architecture.
+4. Is the output plausible, and genuinely in metres? Check a known distance:
+   the wall behind should read about right.
+
+Deliverable: a console tool that loads a saved webcam frame, runs the model,
+prints min/max/centre depth in metres and the per-frame latency, and writes
+the depth out as an image to look at. Nothing else.
+
+#### D2 - integration, shaped by what D1 measures
+
+- **Inference on a worker thread, not the render loop.** The existing webcam
+  capture already establishes the pattern, and for the same reason: a
+  synchronous call that takes tens of milliseconds would drag 60 FPS down to
+  the model's rate.
+- **Depth does not need 60 Hz.** A head is mostly still, so depth can update
+  at 10-15 Hz and be interpolated, while relighting stays at 60. That
+  decouples the cost from the frame rate and is the reason this can work at
+  all if D1 comes back slow.
+- **Letterbox, do not squash.** Resizing 16:9 into a square input distorts
+  the geometry against the real camera, and the depth would then be
+  misaligned with the albedo. Pad to square, run, crop back.
+- **The camera's field of view has to come from somewhere.** The
+  unprojection needs `tanHalfFovX` for the actual webcam, not the synthetic
+  scenes' 65 degrees. A slider with a sensible default is enough - it only
+  scales how pronounced the 3D is - but it is a real input and should not be
+  silently wrong.
+- **Upsampling matters more than it looks.** A 518-wide depth map against a
+  1080p albedo needs an edge-aware, colour-guided upsample in the shader.
+  Plain bilinear smears silhouettes, and the silhouette is where the rim
+  light lives; point sampling makes them blocky. This is the main quality
+  risk in D2.
+- **Temporal smoothing.** ML depth flickers frame to frame, and flicker in a
+  relight is far more obvious than in a depth visualisation. An exponential
+  moving average per pixel, accepting some ghosting on fast movement.
+
+#### Expectation to set now
+
+Everything in phases A to C was judged against perfect synthetic depth with
+exact silhouettes. ML depth is smooth and tends to bleed across depth
+discontinuities, which is precisely the failure that hurts the rim-light
+effect most. It will look worse than the test scenes. The question D2 answers
+is whether it still looks *good*.
 
 ### Known risk, recorded up front
 
