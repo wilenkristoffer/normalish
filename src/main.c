@@ -1,8 +1,11 @@
 #include "raylib.h"
 #include "webcam.h"
 #include "vcamhost.h"
+#include "depth.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -49,6 +52,11 @@ typedef struct RelightShader {
     int texelSizeLoc;
     int reliefLoc;
     int sampleSpacingLoc;
+    int geometryModeLoc;
+    int depthMapLoc;
+    int tanHalfFovXLoc;
+    int depthSpacingLoc;
+    int depthRangeLoc;
 } RelightShader;
 
 typedef struct LightSettings {
@@ -77,6 +85,11 @@ static RelightShader LoadRelightShader(void)
     r.texelSizeLoc = GetShaderLocation(r.shader, "texelSize");
     r.reliefLoc = GetShaderLocation(r.shader, "relief");
     r.sampleSpacingLoc = GetShaderLocation(r.shader, "sampleSpacing");
+    r.geometryModeLoc = GetShaderLocation(r.shader, "geometryMode");
+    r.depthMapLoc = GetShaderLocation(r.shader, "depthMap");
+    r.tanHalfFovXLoc = GetShaderLocation(r.shader, "tanHalfFovX");
+    r.depthSpacingLoc = GetShaderLocation(r.shader, "depthSpacing");
+    r.depthRangeLoc = GetShaderLocation(r.shader, "depthRange");
     return r;
 }
 
@@ -173,9 +186,195 @@ static Rectangle FitRectangle(Rectangle area, int sourceWidth, int sourceHeight)
     };
 }
 
+// A synthetic scene carries its own albedo as well as its depth, because a
+// sphere's depth map means nothing applied to a photograph of a person. The
+// scene data is kept alongside the textures so the analytic normals stay
+// available for the verification pass.
+typedef struct SyntheticSource {
+    bool ready;
+    SyntheticScene scene;
+    Texture2D albedo;
+    Texture2D depth;
+} SyntheticSource;
+
+// A 65 degree horizontal field of view: narrower than a webcam's usual 70-90,
+// and close to what a sensible stereo rig would use for a head and shoulders.
+#define SYNTHETIC_FOV_TAN 0.6371f
+
+static bool LoadSyntheticSource(SyntheticSource *out, DepthScene which, int width, int height)
+{
+    if (!GenerateSyntheticScene(&out->scene, which, width, height, SYNTHETIC_FOV_TAN)) return false;
+
+    Image albedoImage = {
+        .data = out->scene.albedo,
+        .width = width, .height = height, .mipmaps = 1,
+        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    };
+    out->albedo = LoadTextureFromImage(albedoImage);
+    SetTextureFilter(out->albedo, TEXTURE_FILTER_BILINEAR);
+
+    Image depthImage = {
+        .data = out->scene.depth.depth,
+        .width = width, .height = height, .mipmaps = 1,
+        .format = PIXELFORMAT_UNCOMPRESSED_R32
+    };
+    out->depth = LoadTextureFromImage(depthImage);
+    // Point sampling, deliberately. Interpolating across a silhouette invents
+    // a depth halfway between the face and the wall behind it, and a surface
+    // that steep produces a normal pointing anywhere but out.
+    SetTextureFilter(out->depth, TEXTURE_FILTER_POINT);
+
+    out->ready = (out->albedo.id != 0) && (out->depth.id != 0);
+    if (!out->ready)
+    {
+        TraceLog(LOG_WARNING, "DEPTH: synthetic scene %d failed to upload (albedo id %u, depth id %u)",
+                 (int)which, out->albedo.id, out->depth.id);
+    }
+    return out->ready;
+}
+
+static void UnloadSyntheticSource(SyntheticSource *s)
+{
+    if (s->albedo.id != 0) UnloadTexture(s->albedo);
+    if (s->depth.id != 0) UnloadTexture(s->depth);
+    FreeSyntheticScene(&s->scene);
+    s->ready = false;
+}
+
+// Renders the shader's depth-derived normals for a synthetic scene and
+// compares them against that scene's analytic normals.
+//
+// This exists because an unprojection with the aspect ratio inverted, or a
+// cross product taken the wrong way round, produces a normal map that looks
+// entirely plausible on screen and is wrong. Those mistakes show up here as
+// tens of degrees. The floor is about 0.45 degrees, since the normals come
+// back through an 8-bit render target.
+static int VerifyNormals(RelightShader rs, DepthScene which, int width, int height)
+{
+    SyntheticSource s = { 0 };
+    if (!LoadSyntheticSource(&s, which, width, height))
+    {
+        printf("VERIFY: could not build scene %d\n", (int)which);
+        return 1;
+    }
+
+    RenderTexture2D target = LoadRenderTexture(width, height);
+
+    float aspect = (float)width/(float)height;
+    int geometry = GEOMETRY_DEPTH;
+    int view = 1;                       // normals
+    float spacing = 1.0f;
+    float range[2] = { 0.35f, 1.45f };
+    float texel[2] = { 1.0f/(float)width, 1.0f/(float)height };
+
+    SetShaderValue(rs.shader, rs.aspectLoc, &aspect, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.viewModeLoc, &view, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.geometryModeLoc, &geometry, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.tanHalfFovXLoc, &s.scene.depth.tanHalfFovX, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.depthSpacingLoc, &spacing, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.depthRangeLoc, range, SHADER_UNIFORM_VEC2);
+    SetShaderValue(rs.shader, rs.texelSizeLoc, texel, SHADER_UNIFORM_VEC2);
+
+    Rectangle whole = { 0.0f, 0.0f, (float)width, (float)height };
+
+    BeginTextureMode(target);
+    ClearBackground(BLACK);
+    BeginShaderMode(rs.shader);
+    SetShaderValueTexture(rs.shader, rs.depthMapLoc, s.depth);
+    DrawTexturePro(s.albedo, whole, whole, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+
+    Image shot = LoadImageFromTexture(target.texture);
+    if (shot.data == NULL)
+    {
+        printf("VERIFY: readback failed\n");
+        return 1;
+    }
+    ImageFlipVertical(&shot);   // render textures are bottom-up
+
+    const unsigned char *pixels = (const unsigned char *)shot.data;
+    const float *truth = s.scene.normals;
+    const float *depth = s.scene.depth.depth;
+
+    double sum = 0.0;
+    double worst = 0.0;
+    long long counted = 0;
+    double edgeSum = 0.0;
+    double edgeWorst = 0.0;
+    long long edgeCounted = 0;
+
+    for (int y = 1; y < height - 1; y++)
+    {
+        for (int x = 1; x < width - 1; x++)
+        {
+            size_t i = (size_t)y*width + x;
+            if (depth[i] <= 0.0f) continue;
+
+            // At a silhouette the right answer is genuinely ambiguous: the
+            // one-sided difference reports whichever surface it stayed on, and
+            // either is defensible. Those pixels are counted separately rather
+            // than allowed to swamp the interior.
+            bool edge = false;
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    float z = depth[(size_t)(y + dy)*width + (x + dx)];
+                    if ((z <= 0.0f) || (fabsf(z - depth[i]) > 0.02f)) edge = true;
+                }
+            }
+
+            float nx = (pixels[i*4 + 0]/255.0f)*2.0f - 1.0f;
+            float ny = (pixels[i*4 + 1]/255.0f)*2.0f - 1.0f;
+            float nz = (pixels[i*4 + 2]/255.0f)*2.0f - 1.0f;
+            float len = sqrtf(nx*nx + ny*ny + nz*nz);
+            if (len <= 0.0001f) continue;
+            nx /= len; ny /= len; nz /= len;
+
+            float d = nx*truth[i*3 + 0] + ny*truth[i*3 + 1] + nz*truth[i*3 + 2];
+            if (d > 1.0f) d = 1.0f;
+            if (d < -1.0f) d = -1.0f;
+            double degrees = acos(d)*180.0/3.14159265358979;
+
+            if (edge)
+            {
+                edgeSum += degrees;
+                if (degrees > edgeWorst) edgeWorst = degrees;
+                edgeCounted++;
+            }
+            else
+            {
+                sum += degrees;
+                if (degrees > worst) worst = degrees;
+                counted++;
+            }
+        }
+    }
+
+    printf("VERIFY scene %d at %dx%d\n", (int)which, width, height);
+    printf("  interior : mean %.3f deg, worst %.3f deg over %lld px\n",
+           counted ? sum/(double)counted : 0.0, worst, counted);
+    printf("  silhouette: mean %.3f deg, worst %.3f deg over %lld px\n",
+           edgeCounted ? edgeSum/(double)edgeCounted : 0.0, edgeWorst, edgeCounted);
+
+    // Interior normals are exactly computable, so hold them to a tight bound.
+    // 1.5 degrees leaves room over the 8-bit floor without hiding a real bug.
+    bool pass = (counted > 0) && ((sum/(double)counted) < 1.5);
+    printf("  %s\n", pass ? "PASS" : "FAIL");
+
+    UnloadImage(shot);
+    UnloadRenderTexture(target);
+    UnloadSyntheticSource(&s);
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
-    const char *photoPath = (argc > 1) ? argv[1] : ASSET_DIR "/portrait.png";
+    // A leading flag is not a photo path.
+    bool verifyOnly = (argc > 1) && (TextIsEqual(argv[1], "--verify-normals"));
+    const char *photoPath = ((argc > 1) && (argv[1][0] != '-')) ? argv[1]
+                                                                : ASSET_DIR "/portrait.png";
 
     const float baseWidth = 1240.0f;
     const float baseHeight = 860.0f;
@@ -209,6 +408,16 @@ int main(int argc, char **argv)
     SetTextureFilter(photoTexture, TEXTURE_FILTER_BILINEAR);
 
     RelightShader rs = LoadRelightShader();
+
+    if (verifyOnly)
+    {
+        int failures = 0;
+        failures += VerifyNormals(rs, DEPTH_SCENE_SPHERE, 1280, 720);
+        failures += VerifyNormals(rs, DEPTH_SCENE_HEAD, 1280, 720);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return failures;
+    }
 
     LightSettings light = {
         .color = (Color){ 255, 242, 217, 255 },
@@ -268,8 +477,32 @@ int main(int argc, char **argv)
         }
     }
 
-    // 0 = still photo, 1 = live webcam feed.
+    // 0 = still photo, 1 = live webcam feed, 2 = synthetic sphere,
+    // 3 = synthetic head. The synthetic scenes exist to build and check the
+    // depth renderer before a real depth source is chosen.
     int sourceMode = webcamReady ? 1 : 0;
+
+    SyntheticSource synthetic[2] = { 0 };
+    LoadSyntheticSource(&synthetic[0], DEPTH_SCENE_SPHERE, 1280, 720);
+    LoadSyntheticSource(&synthetic[1], DEPTH_SCENE_HEAD, 1280, 720);
+
+    // The flat model stays a first-class choice, not a fallback: it is what
+    // ships on main, and for a still photo there is no depth to be had. It is
+    // also the honest comparison - the same synthetic head under the cheat and
+    // under real depth, one keystroke apart.
+    int geometryMode = GEOMETRY_DEPTH;
+    float depthSpacing = 1.0f;
+
+    // Bound whenever the active source has no depth map. A single zero texel
+    // reads back as "no data", which the shader already handles; leaving the
+    // sampler unbound would instead read whatever texture happened to be on
+    // that unit.
+    float noDepthTexel = 0.0f;
+    Image noDepthImage = {
+        .data = &noDepthTexel, .width = 1, .height = 1, .mipmaps = 1,
+        .format = PIXELFORMAT_UNCOMPRESSED_R32
+    };
+    Texture2D noDepth = LoadTextureFromImage(noDepthImage);
 
     // The light is stored in normalised image coordinates rather than screen
     // pixels, so resizing the window does not move it off the subject.
@@ -297,6 +530,7 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_ONE)) viewMode = 0;
         if (IsKeyPressed(KEY_TWO)) viewMode = 1;
         if (IsKeyPressed(KEY_THREE)) viewMode = 2;
+        if (IsKeyPressed(KEY_FOUR)) viewMode = 3;
 
         if (webcamReady && UpdateWebcamFrame((unsigned char *)webcamFrame.data))
         {
@@ -316,8 +550,32 @@ int main(int argc, char **argv)
                            screenW - panelWidth - margin*2.0f,
                            screenH - margin*2.0f };
 
-        if (!webcamReady) sourceMode = 0;
-        Texture2D albedoTexture = (sourceMode == 1) ? webcamTexture : photoTexture;
+        // Only the webcam entry falls back to the photo; the synthetic scenes
+        // are always available and must not be clobbered here.
+        if (!webcamReady && (sourceMode == 1)) sourceMode = 0;
+
+        int syntheticIndex = (sourceMode == 2) ? 0 : ((sourceMode == 3) ? 1 : -1);
+        if ((syntheticIndex >= 0) && !synthetic[syntheticIndex].ready)
+        {
+            sourceMode = 0;
+            syntheticIndex = -1;
+        }
+
+        Texture2D albedoTexture;
+        if (syntheticIndex >= 0) albedoTexture = synthetic[syntheticIndex].albedo;
+        else if (sourceMode == 1) albedoTexture = webcamTexture;
+        else albedoTexture = photoTexture;
+
+        // Depth mode is only meaningful where there is a depth map. The photo
+        // and the webcam have none yet, so they stay on the luminance model
+        // whatever the setting says.
+        bool depthAvailable = (syntheticIndex >= 0);
+        int activeGeometry = (depthAvailable && (geometryMode == GEOMETRY_DEPTH))
+                           ? GEOMETRY_DEPTH : GEOMETRY_LUMINANCE;
+        float tanHalfFovX = depthAvailable ? synthetic[syntheticIndex].scene.depth.tanHalfFovX
+                                           : SYNTHETIC_FOV_TAN;
+        Texture2D activeDepth = depthAvailable ? synthetic[syntheticIndex].depth : noDepth;
+
         Rectangle quad = FitRectangle(area, albedoTexture.width, albedoTexture.height);
         float aspect = quad.width/quad.height;
 
@@ -378,10 +636,26 @@ int main(int argc, char **argv)
         // The shader lights in texture space. A mirrored feed reverses left and
         // right relative to what is on screen, so flip x on the way in.
         bool mirroredSource = (sourceMode == 1) && mirrorWebcam;
-        float surfaceX = lightU*aspect;
-        if (mirroredSource) surfaceX = aspect - surfaceX;
+        float lightImageU = mirroredSource ? (1.0f - lightU) : lightU;
 
-        float lightPos[3] = { surfaceX, lightV, activeHeight };
+        float lightPos[3];
+        if (activeGeometry == GEOMETRY_DEPTH)
+        {
+            // Camera space, metres. The light is placed inside the view
+            // frustum at the chosen distance using the same unprojection the
+            // shader uses, so pushing it back keeps it visually where it was
+            // put and simply moves it past the subject.
+            float z = activeHeight;
+            lightPos[0] = (lightImageU*2.0f - 1.0f)*tanHalfFovX*z;
+            lightPos[1] = (lightV*2.0f - 1.0f)*(tanHalfFovX/aspect)*z;
+            lightPos[2] = z;
+        }
+        else
+        {
+            lightPos[0] = lightImageU*aspect;
+            lightPos[1] = lightV;
+            lightPos[2] = activeHeight;
+        }
         Vector4 colorNormalized = ColorNormalize(activeColor);
         float lightColor[3] = { colorNormalized.x, colorNormalized.y, colorNormalized.z };
         float texelSize[2] = { 1.0f/albedoTexture.width, 1.0f/albedoTexture.height };
@@ -398,6 +672,11 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.texelSizeLoc, texelSize, SHADER_UNIFORM_VEC2);
         SetShaderValue(rs.shader, rs.reliefLoc, &relief, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.sampleSpacingLoc, &sampleSpacing, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(rs.shader, rs.geometryModeLoc, &activeGeometry, SHADER_UNIFORM_INT);
+        SetShaderValue(rs.shader, rs.tanHalfFovXLoc, &tanHalfFovX, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(rs.shader, rs.depthSpacingLoc, &depthSpacing, SHADER_UNIFORM_FLOAT);
+        float depthRange[2] = { 0.35f, 1.45f };
+        SetShaderValue(rs.shader, rs.depthRangeLoc, depthRange, SHADER_UNIFORM_VEC2);
 
         // Render the relit image again, on its own, at the camera's resolution
         // and without any of the UI. Letterboxed so the source keeps its
@@ -413,6 +692,10 @@ int main(int argc, char **argv)
             BeginTextureMode(cameraTarget);
             ClearBackground(BLACK);
             BeginShaderMode(rs.shader);
+            // Inside shader mode, not before: BeginShaderMode flushes the
+            // batch and rlDrawRenderBatch clears the registered auxiliary
+            // texture units, so an earlier binding is silently discarded.
+            SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
             DrawTexturePro(albedoTexture, cameraSource, cameraQuad, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
             EndShaderMode();
             EndTextureMode();
@@ -442,6 +725,7 @@ int main(int argc, char **argv)
         ClearBackground((Color){ 18, 18, 22, 255 });
 
         BeginShaderMode(rs.shader);
+        SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
         Rectangle albedoSource = { 0.0f, 0.0f, (float)albedoTexture.width, (float)albedoTexture.height };
         // Mirroring the live feed makes it behave like a mirror, which is what
         // you want when you are the subject.
@@ -471,11 +755,34 @@ int main(int argc, char **argv)
         const float groupStep = 34.0f*uiScale;
         float y = 40.0f*uiScale;
 
-        GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Relight");
+        GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Source");
         y += labelStep;
-        if (webcamReady) GuiToggleGroup((Rectangle){ labelX, y, 143.0f*uiScale, 22.0f*uiScale }, "Photo;Webcam feed", &sourceMode);
-        else GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "photo (no webcam)");
+        // A 2x2 grid: raygui splits the label on ';' for columns and on a
+        // newline escape for rows, so the four sources map straight onto
+        // sourceMode 0..3.
+        GuiToggleGroup((Rectangle){ labelX, y, 143.0f*uiScale, 22.0f*uiScale },
+                       "Photo;Webcam feed\nTest: sphere;Test: head", &sourceMode);
+        y += groupStep + 22.0f*uiScale;   // two rows of toggles, not one
+        if (!webcamReady && (sourceMode == 1))
+            GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "no webcam available");
+
+        GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Geometry");
+        y += labelStep;
+        // Depth needs a depth map. The photo and the webcam have none, so the
+        // choice is shown but disabled rather than hidden, which makes it
+        // obvious that the mode exists and why it is unavailable.
+        if (!depthAvailable) GuiSetState(STATE_DISABLED);
+        GuiToggleGroup((Rectangle){ labelX, y, 143.0f*uiScale, 22.0f*uiScale },
+                       "Luminance;Depth", &geometryMode);
+        if (!depthAvailable) GuiSetState(STATE_NORMAL);
         y += groupStep;
+
+        if (activeGeometry == GEOMETRY_DEPTH)
+        {
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Depth taps",
+                         TextFormat("%.0f", depthSpacing), &depthSpacing, 1.0f, 6.0f);
+            y += rowStep;
+        }
 
         // Full demo drives height and colour itself, so those controls become
         // live read-outs rather than inputs while it runs.
@@ -505,8 +812,13 @@ int main(int argc, char **argv)
         y += rowStep;
         float shownHeight = activeHeight;
         if (demoDrivesLook) GuiSetState(STATE_DISABLED);
-        GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Height",
-                     TextFormat("%.2f", shownHeight),
+        // Same slider, different meaning: in depth mode it is the light's
+        // distance from the camera in metres, so pushing it past the subject
+        // is what puts the light behind them.
+        GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH },
+                     (activeGeometry == GEOMETRY_DEPTH) ? "Distance" : "Height",
+                     (activeGeometry == GEOMETRY_DEPTH) ? TextFormat("%.2f m", shownHeight)
+                                                        : TextFormat("%.2f", shownHeight),
                      demoDrivesLook ? &shownHeight : &light.height, 0.02f, 1.5f);
         GuiSetState(STATE_NORMAL);
         y += groupStep;
@@ -600,8 +912,9 @@ int main(int argc, char **argv)
         }
 
         GuiLabel((Rectangle){ labelX, screenH - 52.0f*uiScale, labelW, rowH },
-                 TextFormat("1/2/3 view (%s)   R reload",
-                            viewMode == 0 ? "lit" : (viewMode == 1 ? "normals" : "albedo")));
+                 TextFormat("1/2/3/4 view (%s)   R reload",
+                            (viewMode == 0) ? "lit" : ((viewMode == 1) ? "normals"
+                          : ((viewMode == 2) ? "albedo" : "depth"))));
         DrawText(TextFormat("%i FPS", GetFPS()), (int)labelX, (int)(screenH - 30.0f*uiScale),
                  (int)(14.0f*uiScale), GREEN);
 
@@ -646,6 +959,9 @@ int main(int argc, char **argv)
     if (webcamSystemReady) ShutdownWebcamSystem();
     UnloadShader(rs.shader);
     UnloadTexture(photoTexture);
+    UnloadTexture(noDepth);
+    UnloadSyntheticSource(&synthetic[0]);
+    UnloadSyntheticSource(&synthetic[1]);
     CloseWindow();
     return 0;
 }

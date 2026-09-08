@@ -32,7 +32,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raygui)
 
-add_executable(normalish src/main.c src/webcam.c src/vcamhost.c)
+add_executable(normalish src/main.c src/webcam.c src/vcamhost.c src/depth.c)
 # Media Foundation supplies webcam capture; it ships with Windows. mf.lib is
 # needed for MFEnumDeviceSources specifically, which is not in mfplat.lib.
 target_link_libraries(normalish PRIVATE raylib mf mfplat mfreadwrite mfuuid mfsensorgroup ole32)

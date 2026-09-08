@@ -576,7 +576,7 @@ Consequences worth stating:
 - This branch is experimental by agreement; main remains the fallback if the
   result disappoints.
 
-### Phase A - depth as a first-class input
+### Phase A - depth as a first-class input (DONE)
 
 No visual change; this phase is about correctness.
 
@@ -598,7 +598,31 @@ analytic normals, so render normals-from-depth against ground truth and
 report the angular error. If unprojection or differencing is wrong this
 fails loudly instead of looking plausible.
 
-### Phase B - relight from real normals
+**Result (DONE).** `normalish.exe --verify-normals` renders the shader's
+normals for both scenes into a render target, reads them back and compares
+against the analytic normals:
+
+    VERIFY scene 0 at 1280x720
+      interior : mean 0.319 deg, worst 1.989 deg over 914840 px
+      silhouette: mean 1.415 deg, worst 10.044 deg over 2764 px
+    VERIFY scene 1 at 1280x720
+      interior : mean 0.319 deg, worst 2.134 deg over 912320 px
+      silhouette: mean 1.506 deg, worst 95.643 deg over 5284 px
+
+Interior mean of 0.32 degrees is essentially the 8-bit readback floor, so
+the unprojection, the aspect handling, the cross product order and the sign
+conventions are all correct.
+
+Silhouette pixels are reported separately because the right answer there is
+genuinely ambiguous - the one-sided difference reports whichever surface it
+stayed on. The 95 degree worst case is a pixel where both neighbours on an
+axis lie across the discontinuity, so no choice keeps the estimate on the
+surface. It is 0.6% of pixels, and it matters more than that number
+suggests, because the silhouette is where the rim-light effect lives.
+Recorded rather than fixed: the cheap improvement is to mark such pixels
+unreliable and fill them from their neighbours.
+
+### Phase B - relight from real normals (DONE)
 
 1. Lighting uses depth-derived normals when depth is present, luminance
    otherwise.
@@ -608,6 +632,23 @@ fails loudly instead of looking plausible.
 **Proof:** sweeping the light from in front of the subject to behind it
 should read front-lit, then edge-lit, then dark with a bright rim. If that
 does not look good here, stop and reconsider - this is the go/no-go.
+
+**Result (DONE, go).** On the head scene with the light off to one side:
+
+- 0.25 m - conventional front lighting, and the sphere reads as a sphere
+  rather than as a lit disc.
+- 0.55 m - level with the face. The head goes nearly black with only a
+  specular glint, while the shoulders at 0.70 m stay brightly lit. Correct,
+  and impossible under the luminance model, which has no notion of one part
+  of the image being nearer than another.
+- 0.95 m - behind the head. The subject silhouettes almost black with a
+  bright rim down the lit edge of the head and across the top of the
+  shoulder, and the wall glows behind. **This is the effect the whole branch
+  was for, and it came out of the geometry with no shadow code at all.**
+
+The same screenshots show exactly what is missing: the wall glow is
+uniform around the head, because nothing casts a shadow yet. That is
+phase C.
 
 ### Phase C - screen-space shadows
 
