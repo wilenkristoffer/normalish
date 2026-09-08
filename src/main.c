@@ -353,7 +353,10 @@ int main(int argc, char **argv)
 
             if (demoMode == 1)
             {
-                activeHeight = 0.30f + 0.24f*DriftValue(driftHeight, demoTime);
+                // Kept low and capped at 0.25: a light close to the surface
+                // rakes across the relief and is far more dramatic than a
+                // high one, which flattens everything out.
+                activeHeight = 0.135f + 0.115f*DriftValue(driftHeight, demoTime);
 
                 // Hue drifts steadily and wraps, which stays visually
                 // continuous because the hue wheel joins up at 360.

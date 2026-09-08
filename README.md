@@ -201,7 +201,10 @@ without holding the mouse. Two modes:
 
 - **Basic** moves the light only, using whatever settings you have set by
   hand. Colour, height and everything else stay put.
-- **Full** additionally drifts the light's height and hue on its own.
+- **Full** additionally drifts the light's height and hue on its own. Height
+  is deliberately kept low, between 0.02 and 0.25: a light close to the
+  surface rakes across the derived relief and is far more dramatic, where a
+  high one flattens everything out.
 
 The motion is two sine waves per axis at unrelated frequencies, summed.
 That reads as wandering rather than as an obvious oscillation, and unlike
