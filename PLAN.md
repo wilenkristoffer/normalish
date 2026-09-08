@@ -476,6 +476,168 @@ verifying a precondition:
 - Detect missing registration and offer a one-click elevated install rather
   than failing opaquely.
 
+## Depth-based relighting: put the light behind the subject
+
+Goal: the light should be placeable **behind** the subject, not just above a
+flat relief. That needs to know how far away each pixel is, which the
+luminance cheat fundamentally cannot tell us - it reports a bright shirt as
+a hill.
+
+### What depth buys, and what it does not
+
+A depth map is 2.5D: one depth per pixel, from the camera's viewpoint. There
+is no data for the back of anyone's head, because no camera saw it. So a
+light truly behind the subject cannot illuminate their back. What it can do,
+and what this work is for:
+
+- **Real normals** instead of luminance-as-height. The nose actually
+  protrudes; a bright shirt stops being a hill; glasses stop being bumps.
+- **Rim light when the light goes behind.** Front-facing normals turn away
+  from a light beyond the surface, so the front goes dark and the silhouette
+  catches it. This is the effect we are after.
+- **Cast shadows**, by marching the depth map toward the light in screen
+  space: nose onto cheek, subject onto the wall behind, contact shadows.
+- **Background separation for free**, which retires the masking problem
+  deferred in phase 4.
+
+Not in scope: orbiting the light fully around the subject. That is novel
+view synthesis, a different and far larger problem.
+
+### Hardware investigation (done, 2026-09-08)
+
+Enumerated every Media Foundation device and mode. One camera, one stream:
+the Creative Live! Cam Sync 4K, offering 1920x1080 / 3840x2160 / 2560x1440 /
+1600x1200 / 1280x720 in NV12 and MJPG. No second stream, no IR, no depth,
+no wide side-by-side mode. No Windows Hello IR camera. Single 2560x1440
+display.
+
+**The VIVE Pro was investigated and rejected.** It is registered in PnP (not
+currently connected) and does have a stereo front camera pair, but its
+cameras are 480p each with a **96 degree** horizontal field of view. At a
+normal 600mm working distance that FOV covers ~1333mm of scene width, so a
+150mm face occupies **~72 pixels**. Depth precision along z would have been
+adequate (~19mm per disparity pixel, ~5mm with subpixel fitting); it is the
+lateral resolution that kills it - a 72x90 depth map resolves the nose as a
+blob and the brow, eye sockets and lips not at all, and those broad features
+are exactly what drives believable lighting. Secondary problems: the pair is
+delivered vertically stacked rather than side by side, OpenVR's own
+undistortion is broken specifically on Vive Pro (ValveSoftware/openvr#815),
+access likely requires SteamVR and the OpenVR TrackedCamera API, and it is a
+headset and link box on the desk.
+
+### Candidate depth sources, and why the decision is deferred
+
+| Source | Quality | Cost | Verdict |
+| --- | --- | --- | --- |
+| Synchronised dual-lens UVC module | Good | ~$78, one device, hardware-synced, side-by-side in one stream | Best if hardware is acceptable; drops into the existing device dropdown |
+| Two matched webcams | Good | Two devices, unsynchronised, manual mounting | Fallback |
+| Photometric stereo off the monitor | Real measured normals plus separated albedo, no hardware, no dependency | One-second calibration flash, still subject, dim-ish room | Rejected for now: the user needs the single monitor for other things |
+| ML monocular depth (MiDaS / Depth Anything via ONNX Runtime C API) | Best, live, per-frame, no ritual | One DLL plus a model file; needs a rule exception | Strongest fit given the constraints |
+| Depth from defocus | - | - | Physically impossible: webcam depth of field at 600mm is far too deep |
+| Structure from motion | - | - | Sitting still gives no baseline, and a moving face breaks the rigid-scene assumption |
+
+**The decision is deliberately deferred.** Every source above is just a
+different producer feeding the same consumer, so the renderer is built first
+against a synthetic depth map. That also answers the question worth asking
+before spending anything: whether "light behind me" looks as good as it
+sounds. If it disappoints on perfect synthetic depth, it would never have
+looked good on noisy stereo depth.
+
+### Camera model and conventions (pin these down first)
+
+The current shader treats the image as the z = 0 plane in "surface units"
+(x in 0..aspect, y in 0..1, z above the surface) with an orthographic viewer
+at V = (0,0,1). That is fine for a flat relief and wrong for real depth:
+unprojecting a depth value to a 3D position needs a perspective model.
+
+New convention, camera space, metres, z positive going away from the camera:
+
+    vec2 ndc = uv*2.0 - 1.0;
+    vec3 P;
+    P.z  = depth;                                   // metres from the camera
+    P.xy = ndc*vec2(tanHalfFovX, tanHalfFovX/aspect)*P.z;
+
+Consequences worth stating:
+
+- `lightPos` moves into the same space, so **`lightPos.z` becomes distance
+  from the camera** and "behind the subject" is simply a light z greater
+  than the subject's depth. The existing interaction survives: dragging
+  still picks a screen position, and the height slider becomes a
+  camera-distance slider that sweeps the light from in front of the face to
+  behind it. That single slider is the demo.
+- The viewer is no longer orthographic: `V = normalize(-P)`.
+- The luminance path must keep working unchanged when there is no depth map,
+  for photo mode and as a fallback.
+
+### Phase A - depth as a first-class input
+
+No visual change; this phase is about correctness.
+
+1. A depth-source abstraction in C, so the consumer never knows where depth
+   came from: kind, a texture, and the camera parameters needed to unproject.
+2. A synthetic producer generating analytic scenes - a sphere on a back
+   plane first, then a crude head (sphere plus ellipsoid shoulders plus
+   plane) - with a matching synthetic albedo.
+3. Shader: `depthMap` sampler, `tanHalfFov`, and a validity test so pixels
+   with no depth fall back rather than producing garbage.
+4. Normals from depth by explicit taps rather than `dFdx`, which is
+   per-quad and blocky. Depth discontinuities at silhouette edges produce
+   nonsense normals across the jump, so take the smaller of the forward and
+   backward difference per axis.
+5. New view modes: depth, and normals-from-depth.
+
+**Verification, measurable rather than by eye:** the synthetic scene has
+analytic normals, so render normals-from-depth against ground truth and
+report the angular error. If unprojection or differencing is wrong this
+fails loudly instead of looking plausible.
+
+### Phase B - relight from real normals
+
+1. Lighting uses depth-derived normals when depth is present, luminance
+   otherwise.
+2. Reinterpret and relabel the light's z as camera distance in metres.
+3. Perspective viewer for the specular term.
+
+**Proof:** sweeping the light from in front of the subject to behind it
+should read front-lit, then edge-lit, then dark with a bright rim. If that
+does not look good here, stop and reconsider - this is the go/no-go.
+
+### Phase C - screen-space shadows
+
+This is where "light behind me" becomes convincing rather than merely dark.
+
+March from each surface point toward the light, projecting each step back to
+screen space and comparing against the depth map. Details that will need
+care:
+
+- **Bias**, or every surface shadows itself at step zero.
+- **Jitter** the step offsets, or the shadow edges band visibly.
+- **Occluder thickness.** A depth map has no back face, so the naive
+  assumption is that everything behind the depth surface is solid forever.
+  For a light behind the subject that is correct and gives exactly the
+  dramatic look we want. For a light *between* subject and wall it
+  over-shadows, because the silhouette becomes an infinite slab. A
+  thickness parameter is the standard fix.
+- **Rays that leave the screen, or enter a region with no depth data, are
+  unoccluded** - not shadowed.
+- **Cost.** At 1080p with 32 steps that is ~66M depth samples per frame.
+  Fine on the RX 7800 XT, but the step count gets a slider and this needs
+  measuring rather than assuming.
+
+### Phase D - choose a depth source
+
+Only after seeing phases B and C. The table above is the shortlist, and the
+renderer will not care which is chosen.
+
+### Known risk, recorded up front
+
+The effect lives at silhouette edges, and silhouette edges are the hardest
+place for every candidate depth source - stereo matching fails at occlusion
+boundaries, and ML depth is smooth and tends to bleed across them. Phase A's
+synthetic scenes have perfect edges, so **phases A to C will look better than
+any real depth source will.** Judge the *effect* on synthetic depth; judge
+the *quality* only once real depth is in.
+
 ## Open questions / decisions deferred to when we hit them
 
 - Webcam library choice (Phase 5) - deliberately not decided yet. Note that
