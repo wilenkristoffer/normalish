@@ -1,9 +1,10 @@
-#include "pch.h"
+﻿#include "pch.h"
 #include "Undocumented.h"
 #include "Tools.h"
 #include "EnumNames.h"
 #include "MFTools.h"
 #include "FrameGenerator.h"
+#include "NormalishFrames.h"
 #include "MediaStream.h"
 #include "MediaSource.h"
 
@@ -23,8 +24,8 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 	// set 1 here to force RGB32 only
 	auto types = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(2);
 
-#define NUM_IMAGE_COLS 1280 // 640
-#define NUM_IMAGE_ROWS 960 //480
+#define NUM_IMAGE_COLS 1280
+#define NUM_IMAGE_ROWS 720 // matches what normalish publishes
 
 	wil::com_ptr_nothrow<IMFMediaType> rgbType;
 	RETURN_IF_FAILED(MFCreateMediaType(&rgbType));
@@ -213,9 +214,33 @@ STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
 	RETURN_IF_FAILED(sample->SetSampleTime(MFGetSystemTime()));
 	RETURN_IF_FAILED(sample->SetSampleDuration(333333));
 
-	// generate frame
+	// Prefer a relit frame from normalish. When it is not running, or a frame
+	// is mid-write, fall back to the built-in pattern so the camera keeps
+	// producing something rather than stalling.
 	wil::com_ptr_nothrow<IMFSample> outSample;
-	RETURN_IF_FAILED(_generator.Generate(sample.get(), _format, &outSample));
+	bool filled = false;
+
+	wil::com_ptr_nothrow<IMFMediaBuffer> buffer;
+	if (SUCCEEDED(sample->GetBufferByIndex(0, &buffer)))
+	{
+		BYTE* pixels = nullptr;
+		DWORD maxLength = 0;
+		if (SUCCEEDED(buffer->Lock(&pixels, &maxLength, nullptr)))
+		{
+			filled = _frames.TryFill(pixels, NUM_IMAGE_COLS, NUM_IMAGE_ROWS, _format);
+			buffer->Unlock();
+			if (filled)
+			{
+				const DWORD length = (_format == MFVideoFormat_NV12)
+					? (NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 3 / 2)
+					: (NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 4);
+				if (FAILED(buffer->SetCurrentLength(length))) filled = false;
+			}
+		}
+	}
+
+	if (filled) outSample = sample;
+	else RETURN_IF_FAILED(_generator.Generate(sample.get(), _format, &outSample));
 
 	if (pToken)
 	{

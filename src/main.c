@@ -1,5 +1,6 @@
 #include "raylib.h"
 #include "webcam.h"
+#include "vcamhost.h"
 
 #include <math.h>
 
@@ -222,6 +223,12 @@ int main(int argc, char **argv)
     float sampleSpacing = 3.0f;
     int viewMode = 0;
 
+    // Off by default: ticking it publishes "normalish camera" to other
+    // applications, and nobody's camera list should change without asking.
+    bool exposeAsCamera = false;
+    RenderTexture2D cameraTarget = LoadRenderTexture(GetVirtualCameraWidth(), GetVirtualCameraHeight());
+    Image cameraFrame = GenImageColor(GetVirtualCameraWidth(), GetVirtualCameraHeight(), BLACK);
+
     bool webcamSystemReady = InitWebcamSystem();
     bool webcamReady = false;
     Image webcamFrame = { 0 };
@@ -390,6 +397,45 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.reliefLoc, &relief, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.sampleSpacingLoc, &sampleSpacing, SHADER_UNIFORM_FLOAT);
 
+        // Render the relit image again, on its own, at the camera's resolution
+        // and without any of the UI. Letterboxed so the source keeps its
+        // aspect ratio, which also keeps the shader's own aspect uniform valid.
+        if (exposeAsCamera && IsVirtualCameraRunning())
+        {
+            Rectangle cameraArea = { 0.0f, 0.0f, (float)cameraTarget.texture.width,
+                                     (float)cameraTarget.texture.height };
+            Rectangle cameraQuad = FitRectangle(cameraArea, albedoTexture.width, albedoTexture.height);
+            Rectangle cameraSource = { 0.0f, 0.0f, (float)albedoTexture.width, (float)albedoTexture.height };
+            if (mirroredSource) cameraSource.width = -cameraSource.width;
+
+            BeginTextureMode(cameraTarget);
+            ClearBackground(BLACK);
+            BeginShaderMode(rs.shader);
+            DrawTexturePro(albedoTexture, cameraSource, cameraQuad, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+            EndShaderMode();
+            EndTextureMode();
+
+            // GPU readback. Render textures are bottom-up, and the camera wants
+            // BGRA top-down, so flip and swap channels on the way out.
+            Image shot = LoadImageFromTexture(cameraTarget.texture);
+            if (shot.data != NULL)
+            {
+                ImageFlipVertical(&shot);
+                const unsigned char *from = (const unsigned char *)shot.data;
+                unsigned char *to = (unsigned char *)cameraFrame.data;
+                int pixels = cameraFrame.width*cameraFrame.height;
+                for (int i = 0; i < pixels; i++)
+                {
+                    to[i*4 + 0] = from[i*4 + 2];
+                    to[i*4 + 1] = from[i*4 + 1];
+                    to[i*4 + 2] = from[i*4 + 0];
+                    to[i*4 + 3] = 255;
+                }
+                PublishVirtualCameraFrame(to, cameraFrame.width, cameraFrame.height);
+                UnloadImage(shot);
+            }
+        }
+
         BeginDrawing();
         ClearBackground((Color){ 18, 18, 22, 255 });
 
@@ -513,21 +559,42 @@ int main(int argc, char **argv)
             GuiCheckBox((Rectangle){ labelX, y, 18.0f*uiScale, 18.0f*uiScale }, "Mirror", &mirrorWebcam);
             y += rowStep;
 
-            float previewW = 130.0f*uiScale;
-            Rectangle preview = { labelX, y, previewW, previewW*GetWebcamHeight()/GetWebcamWidth() };
-            Rectangle previewSource = { 0.0f, 0.0f, (float)webcamTexture.width, (float)webcamTexture.height };
-            if (mirrorWebcam) previewSource.width = -previewSource.width;
-            DrawTexturePro(webcamTexture, previewSource, preview, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
-            DrawRectangleLinesEx(preview, uiScale, (Color){ 90, 90, 100, 255 });
-
-            if (followBrightest && tracking)
+            // No preview thumbnail: the main view already shows the feed, so a
+            // second copy of it only competed for panel space.
+            if (followBrightest)
             {
-                float u = trackedPoint.x/(float)GetWebcamWidth();
-                if (mirrorWebcam) u = 1.0f - u;
-                float px = preview.x + u*preview.width;
-                float py = preview.y + (trackedPoint.y/GetWebcamHeight())*preview.height;
-                DrawCircleLines((int)px, (int)py, 8.0f*uiScale, GREEN);
+                GuiLabel((Rectangle){ labelX, y, labelW, rowH },
+                         tracking ? TextFormat("tracking %.0f, %.0f", trackedPoint.x, trackedPoint.y)
+                                  : "no bright spot found");
+                y += labelStep;
             }
+        }
+
+        // Virtual camera. Deliberately last in the panel and off by default:
+        // ticking it makes normalish appear in everyone's camera list.
+        y += 8.0f*uiScale;
+        bool wasExposed = exposeAsCamera;
+        if (IsVirtualCameraSupported() && IsVirtualCameraRegistered())
+        {
+            GuiCheckBox((Rectangle){ labelX, y, 18.0f*uiScale, 18.0f*uiScale },
+                        "Expose as virtual webcam", &exposeAsCamera);
+        }
+        else
+        {
+            GuiSetState(STATE_DISABLED);
+            GuiCheckBox((Rectangle){ labelX, y, 18.0f*uiScale, 18.0f*uiScale },
+                        "Expose as virtual webcam", &exposeAsCamera);
+            GuiSetState(STATE_NORMAL);
+            exposeAsCamera = false;
+        }
+        y += 22.0f*uiScale;
+        GuiLabel((Rectangle){ labelX, y, labelW, rowH },
+                 TextFormat("camera: %s", GetVirtualCameraStatus()));
+
+        if (exposeAsCamera != wasExposed)
+        {
+            if (exposeAsCamera) exposeAsCamera = StartVirtualCamera();
+            else StopVirtualCamera();
         }
 
         GuiLabel((Rectangle){ labelX, screenH - 52.0f*uiScale, labelW, rowH },
@@ -571,6 +638,9 @@ int main(int argc, char **argv)
         UnloadTexture(webcamTexture);
         UnloadImage(webcamFrame);
     }
+    StopVirtualCamera();
+    UnloadRenderTexture(cameraTarget);
+    UnloadImage(cameraFrame);
     if (webcamSystemReady) ShutdownWebcamSystem();
     UnloadShader(rs.shader);
     UnloadTexture(photoTexture);

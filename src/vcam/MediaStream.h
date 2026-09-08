@@ -1,4 +1,6 @@
-#pragma once
+﻿#pragma once
+
+#include "NormalishFrames.h"
 
 struct MediaStream : winrt::implements<MediaStream, CBaseAttributes<IMFAttributes>, IMFMediaStream2, IKsControl>
 {
@@ -51,6 +53,7 @@ private:
 	winrt::slim_mutex  _lock;
 	MF_STREAM_STATE _state;
 	FrameGenerator _generator;
+	NormalishFrames _frames;   // relit frames from normalish, when it is running
 	GUID _format;
 	wil::com_ptr_nothrow<IMFStreamDescriptor> _descriptor;
 	wil::com_ptr_nothrow<IMFMediaEventQueue> _queue;

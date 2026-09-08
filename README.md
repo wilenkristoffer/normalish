@@ -185,6 +185,25 @@ call. Changed from the original: our CLSID, the packaged-app identity lookup
 removed (normalish is unpackaged, and it was the only thing needing a
 generated C++/WinRT projection header), and the build moved to CMake.
 
+Tick **Expose as virtual webcam** in the panel and other applications can
+select "normalish camera" and see the relit feed. Off by default - nobody's
+camera list should change without being asked.
+
+How the frames get across: normalish renders the relit image a second time
+into an offscreen texture at the camera's resolution, without any UI, reads
+it back from the GPU and publishes it into a memory-mapped file
+(`C:\ProgramData\normalish\frame.bin`, format in
+[src/frameshare.h](src/frameshare.h)). The media source reads from the same
+file. A mapped file rather than named shared memory because the media source
+runs in the Frame Server service, in session 0 under another account: a
+`Local\` name would be invisible to it and a `Global\` name needs a
+privilege normal users lack, whereas two processes mapping the same file just
+works. Publishing uses a seqlock - the sequence number is odd while a frame
+is being written - so no cross-session event is needed either.
+
+When normalish is not running the camera shows a test pattern rather than
+freezing, so an application that has it selected does not break.
+
 Registration needs one elevated step, because the DLL is loaded by the
 Camera Frame Server service and by consuming applications, none of which
 read a per-user registry hive:

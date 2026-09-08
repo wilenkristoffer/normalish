@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 # CXX is only for the virtual camera media source DLL, which has to implement
 # COM interfaces. Everything else is C.
 project(normalish C CXX)
@@ -32,10 +32,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raygui)
 
-add_executable(normalish src/main.c src/webcam.c)
+add_executable(normalish src/main.c src/webcam.c src/vcamhost.c)
 # Media Foundation supplies webcam capture; it ships with Windows. mf.lib is
 # needed for MFEnumDeviceSources specifically, which is not in mfplat.lib.
-target_link_libraries(normalish PRIVATE raylib mf mfplat mfreadwrite mfuuid ole32)
+target_link_libraries(normalish PRIVATE raylib mf mfplat mfreadwrite mfuuid mfsensorgroup ole32)
 target_include_directories(normalish PRIVATE ${raygui_SOURCE_DIR}/src)
 
 # Load shaders straight from the source tree so the in-app reload key picks up
@@ -63,6 +63,7 @@ add_library(normalish_vcam SHARED
     src/vcam/MediaSource.cpp
     src/vcam/MediaStream.cpp
     src/vcam/FrameGenerator.cpp
+    src/vcam/NormalishFrames.cpp
     src/vcam/MFTools.cpp
     src/vcam/Tools.cpp
     src/vcam/EnumNames.cpp
