@@ -57,6 +57,9 @@ typedef struct RelightShader {
     int tanHalfFovXLoc;
     int depthSpacingLoc;
     int depthRangeLoc;
+    int shadowStepsLoc;
+    int shadowBiasLoc;
+    int shadowThicknessLoc;
 } RelightShader;
 
 typedef struct LightSettings {
@@ -90,6 +93,9 @@ static RelightShader LoadRelightShader(void)
     r.tanHalfFovXLoc = GetShaderLocation(r.shader, "tanHalfFovX");
     r.depthSpacingLoc = GetShaderLocation(r.shader, "depthSpacing");
     r.depthRangeLoc = GetShaderLocation(r.shader, "depthRange");
+    r.shadowStepsLoc = GetShaderLocation(r.shader, "shadowSteps");
+    r.shadowBiasLoc = GetShaderLocation(r.shader, "shadowBias");
+    r.shadowThicknessLoc = GetShaderLocation(r.shader, "shadowThickness");
     return r;
 }
 
@@ -493,6 +499,13 @@ int main(int argc, char **argv)
     int geometryMode = GEOMETRY_DEPTH;
     float depthSpacing = 1.0f;
 
+    // Shadows: 24 steps is enough for a head at this scale and costs little.
+    // The thickness default is roughly the depth of a head, which is the
+    // shallowest occluder the scenes contain.
+    float shadowSteps = 24.0f;
+    float shadowBias = 0.006f;
+    float shadowThickness = 0.35f;
+
     // Bound whenever the active source has no depth map. A single zero texel
     // reads back as "no data", which the shader already handles; leaving the
     // sampler unbound would instead read whatever texture happened to be on
@@ -677,6 +690,12 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.depthSpacingLoc, &depthSpacing, SHADER_UNIFORM_FLOAT);
         float depthRange[2] = { 0.35f, 1.45f };
         SetShaderValue(rs.shader, rs.depthRangeLoc, depthRange, SHADER_UNIFORM_VEC2);
+        // Zero steps is how shadows are turned off, so the slider is both the
+        // switch and the quality control and costs one panel row instead of two.
+        int activeShadowSteps = (int)shadowSteps;
+        SetShaderValue(rs.shader, rs.shadowStepsLoc, &activeShadowSteps, SHADER_UNIFORM_INT);
+        SetShaderValue(rs.shader, rs.shadowBiasLoc, &shadowBias, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(rs.shader, rs.shadowThicknessLoc, &shadowThickness, SHADER_UNIFORM_FLOAT);
 
         // Render the relit image again, on its own, at the camera's resolution
         // and without any of the UI. Letterboxed so the source keeps its
@@ -782,6 +801,18 @@ int main(int argc, char **argv)
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Depth taps",
                          TextFormat("%.0f", depthSpacing), &depthSpacing, 1.0f, 6.0f);
             y += rowStep;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Shadow steps",
+                         (shadowSteps < 1.0f) ? "off" : TextFormat("%.0f", shadowSteps),
+                         &shadowSteps, 0.0f, 64.0f);
+            y += rowStep;
+            if (shadowSteps < 1.0f) GuiSetState(STATE_DISABLED);
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Thickness",
+                         TextFormat("%.2f m", shadowThickness), &shadowThickness, 0.05f, 1.20f);
+            y += rowStep;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Bias",
+                         TextFormat("%.0f mm", shadowBias*1000.0f), &shadowBias, 0.001f, 0.030f);
+            y += rowStep;
+            GuiSetState(STATE_NORMAL);
         }
 
         // Full demo drives height and colour itself, so those controls become
@@ -823,14 +854,20 @@ int main(int argc, char **argv)
         GuiSetState(STATE_NORMAL);
         y += groupStep;
 
-        GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Derived relief");
-        y += labelStep;
-        GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Relief",
-                     TextFormat("%.1f", relief), &relief, 0.0f, 20.0f);
-        y += rowStep;
-        GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Smoothing",
-                     TextFormat("%.1f", sampleSpacing), &sampleSpacing, 1.0f, 12.0f);
-        y += groupStep;
+        // Relief and smoothing shape the luminance cheat, so they mean nothing
+        // under the depth model. Hiding them there also buys back the panel
+        // height the shadow controls need.
+        if (activeGeometry == GEOMETRY_LUMINANCE)
+        {
+            GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Derived relief");
+            y += labelStep;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Relief",
+                         TextFormat("%.1f", relief), &relief, 0.0f, 20.0f);
+            y += rowStep;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Smoothing",
+                         TextFormat("%.1f", sampleSpacing), &sampleSpacing, 1.0f, 12.0f);
+            y += groupStep;
+        }
 
         GuiLabel((Rectangle){ labelX, y, labelW, rowH }, "Light colour");
         // A live swatch, because raygui greys the picker out while the demo

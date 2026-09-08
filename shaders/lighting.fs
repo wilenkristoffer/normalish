@@ -21,6 +21,10 @@ uniform float tanHalfFovX;    // tan of half the horizontal field of view
 uniform float depthSpacing;   // tap distance in texels for the depth gradient
 uniform vec2 depthRange;      // near/far, only for the depth view mode
 
+uniform int shadowSteps;        // 0 disables the shadow march
+uniform float shadowBias;       // metres; below this a surface shadows itself
+uniform float shadowThickness;  // metres an occluder is assumed to extend back
+
 uniform vec3 lightPos;   // luminance mode: x in 0..aspect, y in 0..1, z above
                          // surface. depth mode: metres in camera space.
 uniform vec3 lightColor;
@@ -118,6 +122,74 @@ vec3 normalFromDepth(vec2 uv)
     return n/len;
 }
 
+// The inverse of depthPosition: a camera-space point back to the pixel that
+// would have seen it.
+vec2 projectToUv(vec3 P)
+{
+    vec2 ndc = vec2(P.x/(tanHalfFovX*P.z), P.y/((tanHalfFovX/aspect)*P.z));
+    return ndc*0.5 + 0.5;
+}
+
+// Cheap per-pixel value in 0..1. Without it the march quantises every shadow
+// edge to a step length and the result is visibly banded.
+float hash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx)*0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y)*p3.z);
+}
+
+// Walk from the surface toward the light, projecting each step back to screen
+// space and asking the depth map whether anything is in front of it. Returns 1
+// for lit, 0 for shadowed.
+//
+// A depth map has no back face, so an occluder is assumed to be a slab of
+// shadowThickness rather than solid all the way to infinity. Without that a
+// silhouette shadows everything behind it forever; with it, a light between
+// the subject and the wall still throws a shadow but distant geometry stops
+// being blocked by anything that merely overlaps it on screen.
+float shadowFactor(vec3 P, vec3 L, float lightDist)
+{
+    if (shadowSteps <= 0) return 1.0;
+
+    // Two metres is past the far wall, and marching the whole way to a distant
+    // light would spend every step in empty space.
+    float span = min(lightDist, 2.0);
+    float stepLen = span/float(shadowSteps);
+    float jitter = hash12(gl_FragCoord.xy);
+
+    // Occluded samples are counted rather than returned on immediately. A
+    // binary test plus jitter dithers every shadow edge into speckle; counting
+    // turns that same jitter into a gradient, which reads as a penumbra and
+    // costs nothing but the loss of the early exit.
+    float occluded = 0.0;
+
+    for (int i = 0; i < shadowSteps; i++)
+    {
+        float t = shadowBias + (float(i) + jitter)*stepLen;
+        if (t >= lightDist) break;
+
+        vec3 S = P + L*t;
+        if (S.z <= 0.0001) break;
+
+        vec2 uv = projectToUv(S);
+        // A straight ray projects to a straight line, so once it leaves the
+        // frame it will not come back and there is nothing more to test.
+        if ((uv.x < 0.0) || (uv.x > 1.0) || (uv.y < 0.0) || (uv.y > 1.0)) break;
+
+        float sceneZ = depthAt(uv);
+        if (sceneZ <= 0.0) continue;    // no data is not an occluder
+
+        float penetration = S.z - sceneZ;
+        if ((penetration > shadowBias) && (penetration < shadowThickness)) occluded += 1.0;
+    }
+
+    // A quarter of the ray spent inside geometry is treated as fully
+    // shadowed; below that the transition is smooth.
+    float coverage = occluded/float(shadowSteps);
+    return 1.0 - smoothstep(0.0, 0.25, coverage);
+}
+
 void main()
 {
     vec3 albedo = texture(texture0, fragTexCoord).rgb*colDiffuse.rgb*fragColor.rgb;
@@ -151,6 +223,16 @@ void main()
     float atten = lightIntensity/(1.0 + falloff*dist*dist);
     float diffuse = max(dot(normal, L), 0.0)*atten;
     float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten;
+
+    // Only the depth model can cast shadows; the luminance model has no
+    // geometry to march through. Ambient is deliberately left out of the
+    // shadow term, since a shadowed surface still sees the room.
+    if (geometryMode == 1)
+    {
+        float shadow = shadowFactor(P, L, dist);
+        diffuse *= shadow;
+        specular *= shadow;
+    }
 
     vec3 color = albedo*(ambient + diffuse*lightColor) + specular*lightColor;
 

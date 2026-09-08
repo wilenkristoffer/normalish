@@ -650,7 +650,7 @@ The same screenshots show exactly what is missing: the wall glow is
 uniform around the head, because nothing casts a shadow yet. That is
 phase C.
 
-### Phase C - screen-space shadows
+### Phase C - screen-space shadows (DONE)
 
 This is where "light behind me" becomes convincing rather than merely dark.
 
@@ -671,6 +671,28 @@ care:
 - **Cost.** At 1080p with 32 steps that is ~66M depth samples per frame.
   Fine on the RX 7800 XT, but the step count gets a slider and this needs
   measuring rather than assuming.
+
+**Result (DONE).** Holds 60 FPS at 24 steps, which is the frame cap, so the
+march is not the limit. The head and shoulders throw a soft shadow onto the
+wall and there is a contact shadow under the chin. With the light behind the
+subject the wall glow is now visibly occluded - confined to the lit side with
+a clear boundary - where in phase B it spread evenly around the head.
+
+Two things had to be fixed after looking at it:
+
+- **A binary occlusion test plus jitter dithers every shadow edge into
+  speckle.** Counting occluded samples along the ray instead, and mapping
+  coverage through a smoothstep, turns that same jitter into a gradient that
+  reads as a penumbra. It costs the early exit out of the loop, which the
+  frame budget did not notice. A quarter of the ray inside geometry is taken
+  as fully shadowed.
+- **The panel overflowed.** Relief and smoothing shape the luminance cheat
+  and mean nothing under the depth model, so they are hidden in depth mode,
+  which paid for most of the new rows. The shadow on/off checkbox was then
+  folded into the step slider - zero steps is off - to pay for the rest.
+
+Shadow bias is exposed as a control rather than fixed, because it is the
+parameter most likely to need tuning once depth is noisy rather than exact.
 
 ### Phase D - choose a depth source
 
