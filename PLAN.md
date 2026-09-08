@@ -384,6 +384,98 @@ Design decisions worth keeping:
   hue wheel joins up at 360 and wrapping is visually continuous.
 - Base window height went from 800 to 860 to fit the extra row.
 
+## Virtual camera: expose normalish as a camera source (DONE)
+
+Goal: a "normalish camera" that Teams (or anything else) can select, showing
+the relit webcam feed, behind a default-off "Expose as virtual webcam"
+toggle. The alternative - OBS with a virtual camera pointed at our window -
+works today but is a hassle, and was deliberately rejected in favour of
+doing the real thing.
+
+Approach: `MFCreateVirtualCamera` (Windows 11 build 22000+, and this machine
+is 26200). Not DirectShow: the new Teams is Chromium-based and Chromium on
+Windows captures through Media Foundation, so a DirectShow-only camera would
+most likely never appear in the list. That is what broke many older virtual
+cameras.
+
+Language exception: implementing a COM server in plain C means hand-rolling
+vtable structs, refcounting and QueryInterface. The media source DLL is
+therefore C++, while normalish itself stays C. Agreed 2026-09-08 as specific
+to this DLL.
+
+### What shipped
+
+- `src/vcam/` - the media source DLL, adopted from smourier/VCamSample (MIT,
+  attribution in `src/vcam/LICENSE-VCamSample.txt`). Changed: our CLSID, the
+  packaged-app identity lookup dropped, CMake instead of MSBuild.
+- `src/vcam/NormalishFrames.cpp` - ours; reads published frames and converts
+  to RGB32 or NV12.
+- `src/frameshare.h` - the producer/consumer contract, plain C, shared by
+  both sides.
+- `src/vcamhost.c` - camera lifecycle and frame publishing from normalish.
+- Frames travel through a memory-mapped file under `C:\ProgramData\normalish`
+  with a seqlock, because the media source runs in the Frame Server service
+  in session 0 under another account.
+- The toggle is default-off and greys out with a reason when
+  `MFIsVirtualCameraTypeSupported` says no. Registration is a one-time
+  elevated `regsvr32`.
+
+The technical gotchas this turned up are in [FINDINGS.md](FINDINGS.md),
+organised by area rather than chronologically.
+
+### How it went, and the root cause
+
+A from-scratch WRL implementation got a long way: the camera appeared in the
+Windows Camera app, could be selected, and negotiated a format - but never
+produced a frame. Eight rounds of diffing against the working reference
+found and fixed a genuine difference each time (the `IMFActivate`
+indirection, HKLM registration, the device-source attributes, separate
+stream attributes, the sensor profile collection, both media types,
+`MF_DEVICESTREAM_FRAMESERVER_SHARED`, the provided-allocator contract) and
+**not one of them changed the symptom.**
+
+The reason none of them appeared to work: **the Camera Frame Server caches a
+device's configuration per CLSID.** The very first `Start` succeeded against
+an early, incomplete source, and every test after that - including an
+entirely different implementation - was served that same stale device. It
+gave itself away when the consumer reported 1280x720, our old dimensions,
+while the adopted source uses 1280x960. `Restart-Service FrameServer -Force`
+and it streamed immediately.
+
+**The lesson, and it is a general one:** when a change appears to have no
+effect at all, suspect that the thing under test is not the thing you
+changed. That possibility should have been checked far earlier - the DLL
+staying locked between builds was already a hint that something outside the
+build was holding state.
+
+**Uncomfortable consequence:** most of rounds five through eight were tested
+against a cached device, so which of those changes were actually necessary
+is unknown. Finding out would mean re-testing each in isolation with a
+service restart between. The from-scratch attempt was not kept - the branch
+was squashed before the feature work began - so it exists only as this
+account.
+
+Two mistakes of method are worth keeping, both the same shape of not
+verifying a precondition:
+
+- The first consumer test pointed normalish's own input dropdown at our
+  virtual camera. That is circular, and it made the architecture look
+  inverted. Replaced with a purpose-built consumer that finds the camera by
+  name and prints exact HRESULTs. (Also a real fix: normalish now excludes
+  its own virtual camera from its input list, or the feedback loop is one
+  click away.)
+- `GetSourceAttributes` returns the raw MF attribute store, so Frame
+  Server's reads on it bypassed our logging. The absence of log lines
+  therefore proved nothing.
+
+### Remaining work
+
+- An info button beside the toggle explaining what registration does: one
+  machine-wide COM entry, no camera until the toggle is on, nothing runs at
+  boot, reversible with `regsvr32 /u`.
+- Detect missing registration and offer a one-click elevated install rather
+  than failing opaquely.
+
 ## Open questions / decisions deferred to when we hit them
 
 - Webcam library choice (Phase 5) - deliberately not decided yet. Note that

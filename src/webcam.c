@@ -1,4 +1,4 @@
-#include "webcam.h"
+﻿#include "webcam.h"
 
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -22,6 +22,8 @@ static IMFSourceReader *reader = NULL;
 static int frameWidth = 0;
 static int frameHeight = 0;
 static bool bottomUp = false;
+static UINT32 selectedWidth = 0;
+static UINT32 selectedHeight = 0;
 static const char *status = "not initialised";
 
 static HANDLE captureThread = NULL;
@@ -52,6 +54,13 @@ static bool GetFrameSize(IMFMediaType *type, UINT32 *width, UINT32 *height)
     *width = (UINT32)(packed >> 32);
     *height = (UINT32)(packed & 0xFFFFFFFFu);
     return true;
+}
+
+// The counterpart to GetFrameSize: pack a width and height into the UINT64 an
+// MF size attribute expects.
+static HRESULT SetAttributePair(IMFAttributes *attributes, const GUID *key, UINT32 high, UINT32 low)
+{
+    return IMFAttributes_SetUINT64(attributes, key, ((UINT64)high << 32) | (UINT64)low);
 }
 
 // Media Foundation hands us BGRX rows; the renderer wants RGBA. Rows may also
@@ -210,14 +219,16 @@ bool InitWebcamSystem(void)
     return true;
 }
 
-// Picks the camera mode whose pixel count is closest to the requested size.
-// Running the camera itself at a small resolution is far cheaper than
-// capturing 4K frames and scaling them down afterwards.
+// Picks a camera mode close to the requested size, but matching aspect ratio
+// first. Choosing purely on pixel count silently picked a 4:3 mode on a camera
+// whose other modes are all 16:9 - asking for 640x480 landed on 1600x1200 -
+// and the mismatch then showed up as black bars downstream.
 static bool SelectClosestNativeMode(int preferredWidth, int preferredHeight)
 {
     long long preferredArea = (long long)preferredWidth*preferredHeight;
+    double preferredAspect = (double)preferredWidth/(double)preferredHeight;
     IMFMediaType *bestType = NULL;
-    long long bestDistance = 0;
+    double bestScore = 0.0;
 
     for (DWORD index = 0;; index++)
     {
@@ -229,15 +240,25 @@ static bool SelectClosestNativeMode(int preferredWidth, int preferredHeight)
         UINT32 width = 0;
         UINT32 height = 0;
         bool kept = false;
-        if (GetFrameSize(type, &width, &height))
+        if (GetFrameSize(type, &width, &height) && (width > 0) && (height > 0))
         {
             long long area = (long long)width*height;
-            long long distance = (area > preferredArea) ? (area - preferredArea) : (preferredArea - area);
-            if ((bestType == NULL) || (distance < bestDistance))
+            double areaRatio = (double)area/(double)preferredArea;
+            if (areaRatio < 1.0) areaRatio = 1.0/areaRatio;
+
+            double aspect = (double)width/(double)height;
+            double aspectRatio = aspect/preferredAspect;
+            if (aspectRatio < 1.0) aspectRatio = 1.0/aspectRatio;
+
+            // Aspect dominates: a wrong shape cannot be undone later, whereas
+            // a wrong size is just scaling.
+            double score = (aspectRatio - 1.0)*100.0 + (areaRatio - 1.0);
+
+            if ((bestType == NULL) || (score < bestScore))
             {
                 if (bestType != NULL) IMFMediaType_Release(bestType);
                 bestType = type;
-                bestDistance = distance;
+                bestScore = score;
                 kept = true;
             }
         }
@@ -246,19 +267,37 @@ static bool SelectClosestNativeMode(int preferredWidth, int preferredHeight)
 
     if (bestType == NULL) return false;
 
+    // Remember the chosen shape: the output type has to be given a frame size
+    // explicitly, or Media Foundation picks its own default and quietly
+    // changed a 16:9 capture into a 4:3 one.
+    GetFrameSize(bestType, &selectedWidth, &selectedHeight);
+
     HRESULT hr = IMFSourceReader_SetCurrentMediaType(reader, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
                                                      NULL, bestType);
     IMFMediaType_Release(bestType);
     return SUCCEEDED(hr);
 }
 
-static bool RequestRgb32Output(void)
+static bool RequestRgb32Output(int preferredHeight)
 {
     IMFMediaType *outputType = NULL;
     if (FAILED(MFCreateMediaType(&outputType))) return false;
 
     IMFMediaType_SetGUID(outputType, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
     IMFMediaType_SetGUID(outputType, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+
+    // Scale down to the requested height but keep the camera's own aspect
+    // ratio, so a 16:9 camera stays 16:9 instead of being reshaped.
+    if ((selectedWidth > 0) && (selectedHeight > 0))
+    {
+        UINT32 outHeight = (UINT32)preferredHeight;
+        if (outHeight > selectedHeight) outHeight = selectedHeight;
+        UINT32 outWidth = (UINT32)(((double)selectedWidth/(double)selectedHeight)*outHeight + 0.5);
+        outWidth &= ~1u;    // even dimensions keep every format happy
+        outHeight &= ~1u;
+        SetAttributePair((IMFAttributes *)outputType, &MF_MT_FRAME_SIZE, outWidth, outHeight);
+    }
+
     HRESULT hr = IMFSourceReader_SetCurrentMediaType(reader, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
                                                      NULL, outputType);
     IMFMediaType_Release(outputType);
@@ -352,7 +391,7 @@ bool OpenWebcam(int deviceIndex, int preferredWidth, int preferredHeight)
         CloseWebcam();
         return false;
     }
-    if (!RequestRgb32Output())
+    if (!RequestRgb32Output(preferredHeight))
     {
         status = "camera cannot deliver RGB32";
         CloseWebcam();

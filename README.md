@@ -65,10 +65,12 @@ a learned approach later if the cheat isn't good enough.
 ```
 normalish/
   README.md
-  PLAN.md
-  CMakeLists.txt   build definition (also fetches raylib and raygui)
+  PLAN.md          phase-by-phase implementation record
+  FINDINGS.md      technical gotchas worth keeping, by area
+  CMakeLists.txt   build definition (also fetches raylib, raygui and WIL)
   build.ps1        build/run wrapper
-  src/             main.c and webcam capture
+  src/             main.c, webcam capture, virtual camera host
+  src/vcam/        Media Foundation media source DLL (C++)
   shaders/         GLSL fragment shaders
   assets/          input photos
   build/           generated - build output and fetched raylib (not tracked)
@@ -165,6 +167,56 @@ rough proxy for depth. Hard side light bakes a direction into the derived
 "geometry" and fights the light you are trying to move; glare and glossy
 highlights become permanent fake bumps; and glasses are the worst offender
 because lens reflections read as raised blobs.
+
+## Virtual camera
+
+[src/vcam/](src/vcam/) is a Media Foundation media source DLL that exposes
+"normalish camera" as a real camera device, so any application - Teams,
+Zoom, a browser - can select it and see the relit feed. It is the one part
+of the project that is C++ rather than C: implementing a COM server in plain
+C means hand-rolling vtables, reference counting and QueryInterface.
+
+**It is adopted from [smourier/VCamSample](https://github.com/smourier/VCamSample)
+by Simon Mourier, MIT licensed** - see
+[src/vcam/LICENSE-VCamSample.txt](src/vcam/LICENSE-VCamSample.txt). A
+from-scratch implementation reached the point where the camera appeared,
+could be selected and negotiated a format, but never produced frames.
+Changed from the original: our CLSID, the packaged-app identity lookup
+removed (normalish is unpackaged, and it was the only thing needing a
+generated C++/WinRT projection header), and the build moved to CMake.
+
+### Using it
+
+Registration is a one-time elevated step, because the DLL is loaded by the
+Camera Frame Server service and by consuming applications, none of which
+read a per-user registry hive:
+
+```powershell
+regsvr32 C:\ProgramData\normalish\normalish_vcam.dll      # elevated
+regsvr32 /u C:\ProgramData\normalish\normalish_vcam.dll   # to undo
+```
+
+Then tick **Expose as virtual webcam** in the panel. It is off by default -
+nobody's camera list should change without being asked - and no camera
+appears in anyone's list until normalish is running with the toggle on: the
+camera uses `MFVirtualCameraLifetime_Session`, so it exists only while the
+owning process holds it. When normalish stops publishing, the camera shows a
+test pattern rather than freezing, so an application that has it selected
+does not break.
+
+### How frames get across
+
+normalish renders the relit image a second time into an offscreen texture at
+the camera's resolution, without any UI, reads it back from the GPU and
+publishes it into a memory-mapped file
+(`C:\ProgramData\normalish\frame.bin`; the format is in
+[src/frameshare.h](src/frameshare.h) and the reader is
+[src/vcam/NormalishFrames.cpp](src/vcam/NormalishFrames.cpp)). A mapped file
+rather than shared memory because the media source runs in a service in
+session 0 under another account - see [FINDINGS.md](FINDINGS.md) for why
+that rules out the obvious alternatives, along with the rest of what this
+took to get working. **If you change the DLL, restart the Frame Server
+service** or it will keep serving the old configuration.
 
 ## Assets and credits
 
