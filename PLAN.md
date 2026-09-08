@@ -353,6 +353,37 @@ If controlling it by body position matters, the cheap next step is frame
 differencing to track motion instead of brightness. Real face tracking is a
 much larger jump and should wait until there is a reason for it.
 
+## Demo mode
+
+Built on the `feature/demo-mode` branch, after the five planned phases. A
+self-driving light so the effect can be demonstrated without holding the
+mouse. Basic moves position only and respects every setting made by hand;
+Full also drifts height and hue.
+
+Motion approach: two sine waves per axis at unrelated frequencies, summed,
+with phases randomised at startup. Considered and rejected: interpolating
+between random waypoints, which stalls momentarily at every target unless
+you go to Catmull-Rom for continuous velocity; and Perlin noise, which
+raylib has no scalar version of and which would have to be written from
+scratch for no visible gain here. Summed sines give continuous velocity for
+about four lines of code.
+
+Design decisions worth keeping:
+- The demo never writes into the user's settings. It computes an
+  `activeHeight` and `activeColor` used only for the shader upload, so
+  switching the demo off restores whatever was set by hand. Writing into
+  `light` directly would have destroyed the user's values and made the
+  sliders jitter and fight the demo.
+- While Full runs, the Height slider and colour picker are switched to
+  `STATE_DISABLED` and fed a temporary copy of the live demo value, so they
+  read out what is happening instead of lying about it.
+- raygui's disabled styling greys the colour picker out, which hides the
+  colour it is meant to be showing. A small live swatch next to the "Light
+  colour" label fixes that.
+- Hue is allowed to wrap with `fmodf` rather than being clamped, because the
+  hue wheel joins up at 360 and wrapping is visually continuous.
+- Base window height went from 800 to 860 to fit the extra row.
+
 ## Open questions / decisions deferred to when we hit them
 
 - Webcam library choice (Phase 5) - deliberately not decided yet. Note that

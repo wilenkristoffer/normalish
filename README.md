@@ -194,6 +194,29 @@ still holds 60 FPS, so the per-pixel Sobel work is not a bottleneck at 4K.
 The light is stored in normalised image coordinates rather than screen
 pixels, so resizing the window leaves it where you put it on the subject.
 
+## Demo mode
+
+Tick **Demo** and the light drives itself, so the effect can be shown off
+without holding the mouse. Two modes:
+
+- **Basic** moves the light only, using whatever settings you have set by
+  hand. Colour, height and everything else stay put.
+- **Full** additionally drifts the light's height and hue on its own.
+
+The motion is two sine waves per axis at unrelated frequencies, summed.
+That reads as wandering rather than as an obvious oscillation, and unlike
+interpolating between random waypoints there is no momentary stop at each
+target - the light never stalls. Phases are randomised at startup, so no two
+runs trace the same path. Height and hue drift the same way, at slower
+rates.
+
+Your slider values are never overwritten, so switching the demo off gives
+you back exactly what you had. While Full is running, the Height slider and
+colour picker become live read-outs instead of inputs, greyed out to show
+they are not yours to move at that moment - with a small swatch beside the
+"Light colour" label showing the current colour, since raygui's disabled
+styling would otherwise hide it.
+
 ## Controls
 
 Most tuning lives in the raygui panel on the right: light intensity,
@@ -202,7 +225,7 @@ map's relief and blur.
 
 | Input | Action |
 | --- | --- |
-| Mouse move | move the light (over the photo, when "Follow light" is off) |
+| Mouse move | move the light (over the image, unless Demo is on) |
 | Mouse wheel | raise/lower the light above the surface |
 | 1 / 2 / 3 | view lit result / normals / albedo only |
 | R | reload the shader from disk (no rebuild needed) |
