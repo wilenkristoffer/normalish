@@ -209,6 +209,21 @@ and likewise for streams.
   for relative structure, and derive every parameter from the scene's own
   reported range; do not compare absolute values across frames, and do not
   build a decision on one.
+- **A live camera is not a test fixture when the scene can change.** Three
+  conclusions here were drawn from before-and-after screenshots of a room
+  with other people moving in it, and each compared two different scenes: an
+  empty chair that had supposedly moved, a speckle artefact that appeared to
+  survive a fix, and a mask that seemed to cover the wrong thing. Grab one
+  frame and render *that* repeatedly instead.
+- **With a flat normal, `dot(N, L)` is proportional to `P.z - lightPos.z`**,
+  so it crosses zero exactly at the light's depth plane and `max(dot, 0)`
+  clamps hard there. Any surface lying near that plane flickers on and off
+  with depth noise. A wrapped term that never reaches zero removes the
+  terminator; the falloff still places the light.
+- **Clamp the minimum distance in a point light's falloff.** The derivative
+  of `1/(1 + f d^2)` is largest as d approaches zero, which is exactly where
+  depth noise becomes speckle and where putting the light on a surface blows
+  it out.
 - **Do not explain a surprising number until you have measured why.** Two
   confident explanations were offered for a chair outscoring a person - that
   empty chairs are nearer than their occupants, and that the chair had been

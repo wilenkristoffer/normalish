@@ -63,7 +63,7 @@ typedef struct RelightShader {
     int depthReliefLoc;
     int subjectMaskLoc;
     int maskEnabledLoc;
-    int maskStrengthLoc;
+    int roomLightLoc;
     int shadowStepsLoc;
     int shadowBiasLoc;
     int shadowThicknessLoc;
@@ -105,7 +105,7 @@ static RelightShader LoadRelightShader(void)
     r.depthReliefLoc = GetShaderLocation(r.shader, "depthRelief");
     r.subjectMaskLoc = GetShaderLocation(r.shader, "subjectMask");
     r.maskEnabledLoc = GetShaderLocation(r.shader, "maskEnabled");
-    r.maskStrengthLoc = GetShaderLocation(r.shader, "maskStrength");
+    r.roomLightLoc = GetShaderLocation(r.shader, "roomLight");
     r.shadowStepsLoc = GetShaderLocation(r.shader, "shadowSteps");
     r.shadowBiasLoc = GetShaderLocation(r.shader, "shadowBias");
     r.shadowThicknessLoc = GetShaderLocation(r.shader, "shadowThickness");
@@ -458,7 +458,8 @@ static int GrabWebcamFrame(const char *outPath, int mode, int settleFrames)
 // taken of an empty chair, which says nothing about a person detector. A fixed
 // frame makes the check repeatable, and it runs the same code path the app
 // does rather than a parallel copy of it.
-static int RunDepthOnImage(const char *path, const char *outPrefix)
+static int RunDepthOnImage(const char *path, const char *outPrefix,
+                           RelightShader rs, float lightU, float lightV)
 {
     SetDepthModelVerbose(true);
     if (!InitDepthModel())
@@ -539,7 +540,94 @@ static int RunDepthOnImage(const char *path, const char *outPrefix)
 
     ExportImage(depthImage, TextFormat("%s-depth.png", outPrefix));
     ExportImage(maskImage, TextFormat("%s-mask.png", outPrefix));
-    printf("  wrote      : %s-depth.png, %s-mask.png\n", outPrefix, outPrefix);
+
+    // And the lit render. Iterating on how the lighting looks against a live
+    // camera does not work: this room has other people in it, and comparing
+    // two screenshots taken a minute apart compares two different scenes.
+    // Rendering a saved frame is the only way a look change can be judged.
+    Texture2D albedoTex = LoadTextureFromImage(frame);
+    SetTextureFilter(albedoTex, TEXTURE_FILTER_BILINEAR);
+
+    Image depthUpload = { .data = (void *)depth, .width = w, .height = h,
+                          .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R32 };
+    Texture2D depthTex = LoadTextureFromImage(depthUpload);
+    SetTextureFilter(depthTex, TEXTURE_FILTER_BILINEAR);
+    Texture2D maskTex = LoadTextureFromImage(maskImage);
+    SetTextureFilter(maskTex, TEXTURE_FILTER_BILINEAR);
+
+    RenderTexture2D target = LoadRenderTexture(frame.width, frame.height);
+    float aspect = (float)frame.width/(float)frame.height;
+    float tanHalfFovX = tanf(70.0f*0.5f*PI/180.0f);
+    float lightZ = near*1.15f;
+
+    float lightPos[3] = {
+        (lightU*2.0f - 1.0f)*tanHalfFovX*lightZ,
+        (lightV*2.0f - 1.0f)*(tanHalfFovX/aspect)*lightZ,
+        lightZ
+    };
+    float lightColor[3] = { 1.0f, 0.949f, 0.851f };
+    float texel[2] = { 1.0f/(float)frame.width, 1.0f/(float)frame.height };
+    float depthTexel[2] = { 1.0f/(float)w, 1.0f/(float)h };
+    float range[2] = { near, far };
+    int geometry = GEOMETRY_DEPTH;
+    int view = 0;
+    int maskOn = 1;
+    int steps = 24;
+    float intensity = 2.2f, falloff = 2.0f, ambientLevel = 0.18f;
+    float specular = 0.35f, shininess = 32.0f;
+    float reliefValue = 0.02f, spacing = 1.0f;
+    float thickness = near*0.68f, bias = near*0.012f;
+    float roomLightValue = 0.5f;
+
+    SetShaderValue(rs.shader, rs.lightPosLoc, lightPos, SHADER_UNIFORM_VEC3);
+    SetShaderValue(rs.shader, rs.lightColorLoc, lightColor, SHADER_UNIFORM_VEC3);
+    SetShaderValue(rs.shader, rs.lightIntensityLoc, &intensity, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.falloffLoc, &falloff, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.ambientLoc, &ambientLevel, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.specularStrengthLoc, &specular, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.shininessLoc, &shininess, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.aspectLoc, &aspect, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.viewModeLoc, &view, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.texelSizeLoc, texel, SHADER_UNIFORM_VEC2);
+    SetShaderValue(rs.shader, rs.geometryModeLoc, &geometry, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.tanHalfFovXLoc, &tanHalfFovX, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.depthSpacingLoc, &spacing, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.depthRangeLoc, range, SHADER_UNIFORM_VEC2);
+    SetShaderValue(rs.shader, rs.distanceScaleLoc, &near, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.depthTexelSizeLoc, depthTexel, SHADER_UNIFORM_VEC2);
+    SetShaderValue(rs.shader, rs.depthReliefLoc, &reliefValue, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.maskEnabledLoc, &maskOn, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.roomLightLoc, &roomLightValue, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.shadowStepsLoc, &steps, SHADER_UNIFORM_INT);
+    SetShaderValue(rs.shader, rs.shadowBiasLoc, &bias, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs.shader, rs.shadowThicknessLoc, &thickness, SHADER_UNIFORM_FLOAT);
+
+    Rectangle whole = { 0.0f, 0.0f, (float)frame.width, (float)frame.height };
+    BeginTextureMode(target);
+    ClearBackground(BLACK);
+    BeginShaderMode(rs.shader);
+    SetShaderValueTexture(rs.shader, rs.depthMapLoc, depthTex);
+    SetShaderValueTexture(rs.shader, rs.subjectMaskLoc, maskTex);
+    DrawTexturePro(albedoTex, whole, whole, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+
+    Image lit = LoadImageFromTexture(target.texture);
+    if (lit.data != NULL)
+    {
+        ImageFlipVertical(&lit);    // render textures are bottom-up
+        ExportImage(lit, TextFormat("%s-lit.png", outPrefix));
+        UnloadImage(lit);
+    }
+
+    UnloadRenderTexture(target);
+    UnloadTexture(albedoTex);
+    UnloadTexture(depthTex);
+    UnloadTexture(maskTex);
+
+    printf("  light      : u %.2f v %.2f, z %.3f\n", lightU, lightV, lightZ);
+    printf("  wrote      : %s-depth.png, %s-mask.png, %s-lit.png\n",
+           outPrefix, outPrefix, outPrefix);
 
     RL_FREE(grey);
     UnloadImage(frame);
@@ -604,7 +692,11 @@ int main(int argc, char **argv)
 
     if (depthImageOnly)
     {
-        int result = RunDepthOnImage(argv[2], argv[3]);
+        // Optional light position, so the same frame can be relit from
+        // several places without the scene changing in between.
+        float lightU = (argc > 4) ? (float)atof(argv[4]) : 0.5f;
+        float lightV = (argc > 5) ? (float)atof(argv[5]) : 0.5f;
+        int result = RunDepthOnImage(argv[2], argv[3], rs, lightU, lightV);
         UnloadShader(rs.shader);
         CloseWindow();
         return result;
@@ -720,7 +812,9 @@ int main(int argc, char **argv)
     // On by default: relighting the background is what produced the worst
     // artefacts, and it is not what the effect is for.
     bool subjectOnly = true;
-    float maskStrength = 0.0f;
+    // The light should be visible moving around the room, not only on the
+    // subject - that was the whole charm of the flat model it replaced.
+    float roomLight = 0.5f;
     float subjectBand = 0.9f;
     int liveDepthW = 0, liveDepthH = 0;
     bool haveLiveDepth = false;
@@ -1041,7 +1135,7 @@ int main(int argc, char **argv)
         // Only the live source has a mask; a synthetic scene is all subject.
         int maskEnabled = (liveDepthUsable && subjectOnly) ? 1 : 0;
         SetShaderValue(rs.shader, rs.maskEnabledLoc, &maskEnabled, SHADER_UNIFORM_INT);
-        SetShaderValue(rs.shader, rs.maskStrengthLoc, &maskStrength, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(rs.shader, rs.roomLightLoc, &roomLight, SHADER_UNIFORM_FLOAT);
         // Zero steps is how shadows are turned off, so the slider is both the
         // switch and the quality control and costs one panel row instead of two.
         int activeShadowSteps = (int)shadowSteps;
@@ -1165,8 +1259,8 @@ int main(int argc, char **argv)
                              &subjectBand, 0.2f, 3.0f);
                 if (subjectBand != beforeBand) SetSubjectBand(subjectBand);
                 y += rowStep;
-                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Spill",
-                             TextFormat("%.2f", maskStrength), &maskStrength, 0.0f, 1.0f);
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Room light",
+                             TextFormat("%.2f", roomLight), &roomLight, 0.0f, 1.0f);
                 GuiSetState(STATE_NORMAL);
                 y += rowStep;
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Camera FOV",

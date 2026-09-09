@@ -33,13 +33,18 @@ uniform vec2 depthTexelSize;
 // shape for normals that are not dominated by that error.
 uniform float depthRelief;
 
-// Which pixels are the subject, so the room behind them can be left alone.
-// Relighting the whole frame means relighting curtains and furniture, where
-// the depth model is least reliable and where the artefacts are worst - and
-// nobody wanted those relit anyway.
+// Which pixels are the subject.
+//
+// The subject is shaded with the measured normal. The room is shaded with a
+// flat normal facing the camera instead, which is the point of the split: the
+// artefacts that made relighting the whole frame unusable came from the
+// model's noisy depth gradients, not from the light itself. With a flat
+// normal the room still gets distance falloff and a smooth pool of light, so
+// the light stays visible as it moves around the scene, and there is no
+// gradient left to go wrong.
 uniform sampler2D subjectMask;
-uniform int maskEnabled;      // 0 relights everything, as before
-uniform float maskStrength;   // how far outside the subject the light reaches
+uniform int maskEnabled;      // 0 shades everything with measured normals
+uniform float roomLight;      // how strongly the light reaches the room, 0 = not at all
 uniform vec2 depthRange;      // near/far of the source, for the depth view
 // Distance at which falloff is measured, so one falloff setting means the
 // same thing whether the scene is a synthetic head at 0.6 m or a real room
@@ -102,6 +107,32 @@ vec3 computeNormal(vec2 uv)
 float depthAt(vec2 uv)
 {
     return texture(depthMap, uv).r;
+}
+
+// A deliberately blurred depth, for the room's lighting only.
+//
+// The room is shaded with a flat normal, so its gradient noise cannot reach
+// the shading - but the *distance* to the light still comes from the depth,
+// and the falloff amplifies noise there badly. Five wide taps keep the large
+// structure, which is all the room path needs, and drop the per-pixel wobble.
+float smoothDepthAt(vec2 uv)
+{
+    vec2 d = depthTexelSize*3.0;
+    float z = depthAt(uv);
+    if (z <= 0.0) return 0.0;
+
+    float sum = z;
+    float n = 1.0;
+    float taps[4] = float[4](
+        depthAt(uv + vec2( d.x, 0.0)),
+        depthAt(uv - vec2( d.x, 0.0)),
+        depthAt(uv + vec2( 0.0, d.y)),
+        depthAt(uv - vec2( 0.0, d.y)));
+    for (int i = 0; i < 4; i++)
+    {
+        if (taps[i] > 0.0) { sum += taps[i]; n += 1.0; }
+    }
+    return sum/n;
 }
 
 // A depth sample back to the 3D point that produced it.
@@ -256,15 +287,57 @@ void main()
         V = vec3(0.0, 0.0, 1.0);   // orthographic viewer looking straight on
     }
 
+    // How much of this pixel is subject. Outside it, swing the normal back to
+    // face the camera so the room is lit as though it were a flat surface at
+    // its measured depth - depth is reliable enough for distance, and it is
+    // the gradient that is not.
+    float subject = 1.0;
+    if ((geometryMode == 1) && (maskEnabled == 1))
+    {
+        subject = texture(subjectMask, fragTexCoord).r;
+        normal = normalize(mix(vec3(0.0, 0.0, -1.0), normal, subject));
+
+        // And take the room's position from the blurred depth, so the falloff
+        // distance is smooth there too.
+        float zSmooth = smoothDepthAt(fragTexCoord);
+        if (zSmooth > 0.0)
+        {
+            vec2 ndc = fragTexCoord*2.0 - 1.0;
+            float zUse = mix(zSmooth, P.z, subject);
+            P = vec3(ndc.x*tanHalfFovX*zUse, ndc.y*(tanHalfFovX/aspect)*zUse, zUse);
+        }
+    }
+
     vec3 toLight = lightPos - P;
     float dist = length(toLight);
     vec3 L = toLight/max(dist, 0.0001);
     vec3 H = normalize(L + V);
 
-    float scaled = dist/max(distanceScale, 0.0001);
+    // A point light has a singularity at zero distance, and the falloff's
+    // derivative is largest there - which is exactly where depth noise turns
+    // into speckle, and where placing the light on a surface blows it out.
+    // Clamping the distance to a fraction of the scene's near plane bounds
+    // both. The direction is taken before the clamp, so the light still
+    // points from where it was put.
+    float scaled = max(dist, distanceScale*0.25)/max(distanceScale, 0.0001);
     float atten = lightIntensity/(1.0 + falloff*scaled*scaled);
-    float diffuse = max(dot(normal, L), 0.0)*atten;
-    float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten;
+
+    // With a flat normal, dot(N, L) reduces to (P.z - lightPos.z)/dist, so it
+    // passes through exactly zero at the light's depth plane and max(dot, 0)
+    // clamps hard there. Any surface sitting near that plane then flickers on
+    // and off with the model's depth noise, which is what speckled the room.
+    //
+    // The room therefore uses a wrapped term that never reaches zero and has
+    // no terminator to straddle. It gives up the fact that a light behind a
+    // wall should not light it - a distinction resting on the least reliable
+    // part of the depth - and keeps distance falloff doing the work of placing
+    // the light. The subject keeps true Lambert, where the normals are real.
+    float ndl = dot(normal, L);
+    float diffuse = mix(ndl*0.5 + 0.5, max(ndl, 0.0), subject)*atten;
+    // Diffuse only in the room: a specular highlight on a flat normal is a
+    // hard bright disc, which reads as a blemish on a wall rather than as a
+    // glint on a surface.
+    float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten*subject;
 
     // Only the depth model can cast shadows; the luminance model has no
     // geometry to march through. Ambient is deliberately left out of the
@@ -278,13 +351,12 @@ void main()
 
     vec3 color = albedo*(ambient + diffuse*lightColor) + specular*lightColor;
 
-    // Blend back to the untouched frame outside the subject. The original
-    // pixels already carry the room's own lighting, so they are the honest
-    // thing to fall back to.
+    // The subject is fully relit; the room is blended toward its lit version
+    // by roomLight, so 0 leaves the frame exactly as the camera saw it and
+    // higher values let the light show in the scene.
     if ((geometryMode == 1) && (maskEnabled == 1))
     {
-        float subject = texture(subjectMask, fragTexCoord).r;
-        color = mix(albedo, color, clamp(subject + maskStrength, 0.0, 1.0));
+        color = mix(albedo, color, mix(roomLight, 1.0, subject));
     }
 
     if (viewMode == 4)
