@@ -505,6 +505,23 @@ static int RunDepthOnImage(const char *path, const char *outPrefix)
     printf("  mask       : %.1f%% of the frame\n", 100.0*(double)covered/(double)count);
     printf("  score      : %.3f\n", GetSubjectScore());
 
+    // Raw metres on a fixed grid. Comparing two frames of the same room at
+    // identical coordinates is the only way to tell a change in the scene
+    // apart from the model's absolute scale moving under us - and the second
+    // of those would undermine treating its output as metres at all.
+    printf("  probe grid (metres):\n");
+    for (int gy = 1; gy <= 3; gy++)
+    {
+        printf("   ");
+        for (int gx = 1; gx <= 5; gx++)
+        {
+            int px = gx*w/6;
+            int py = gy*h/4;
+            printf(" %6.3f", depth[(size_t)py*w + px]);
+        }
+        printf("\n");
+    }
+
     // Near is white, so the visualisation matches the in-app depth view.
     unsigned char *grey = (unsigned char *)RL_MALLOC(count);
     for (size_t i = 0; i < count; i++)
@@ -897,6 +914,12 @@ int main(int argc, char **argv)
             shadowBias = sceneNear*0.012f;
         }
 
+        // Only the synthetic scenes have depths that are actually in metres.
+        // The model's output is metre-like but measured 3x out on this camera,
+        // so labelling its sliders "m" would present a fabricated distance as
+        // a measured one.
+        const char *depthUnit = (syntheticIndex >= 0) ? "m" : "u";
+
         Rectangle quad = FitRectangle(area, albedoTexture.width, albedoTexture.height);
         float aspect = quad.width/quad.height;
 
@@ -1138,7 +1161,8 @@ int main(int argc, char **argv)
                 if (!subjectOnly) GuiSetState(STATE_DISABLED);
                 float beforeBand = subjectBand;
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Subject depth",
-                             TextFormat("%.2f m", subjectBand), &subjectBand, 0.2f, 3.0f);
+                             TextFormat("%.2f %s", subjectBand, depthUnit),
+                             &subjectBand, 0.2f, 3.0f);
                 if (subjectBand != beforeBand) SetSubjectBand(subjectBand);
                 y += rowStep;
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Spill",
@@ -1164,11 +1188,11 @@ int main(int argc, char **argv)
             y += rowStep;
             if (shadowSteps < 1.0f) GuiSetState(STATE_DISABLED);
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Thickness",
-                         TextFormat("%.2f m", shadowThickness), &shadowThickness,
+                         TextFormat("%.2f %s", shadowThickness, depthUnit), &shadowThickness,
                          sceneNear*0.1f, sceneNear*2.5f);
             y += rowStep;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Bias",
-                         TextFormat("%.0f mm", shadowBias*1000.0f), &shadowBias,
+                         TextFormat("%.3f %s", shadowBias, depthUnit), &shadowBias,
                          sceneNear*0.002f, sceneNear*0.06f);
             y += rowStep;
             GuiSetState(STATE_NORMAL);
@@ -1213,7 +1237,7 @@ int main(int argc, char **argv)
             // subject whatever the scale.
             float shownDistance = depthLightDistance;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Distance",
-                         TextFormat("%.2f m", shownDistance),
+                         TextFormat("%.2f %s", shownDistance, depthUnit),
                          demoDrivesLook ? &shownDistance : &depthLightDistance,
                          0.05f, sceneFar*1.1f);
         }

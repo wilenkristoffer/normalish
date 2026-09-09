@@ -932,25 +932,63 @@ of the bottom of frame - every feature the scoring rewards. So the selector
 is a nearest-central-object selector, and the code and docs now say so rather
 than calling it a person detector.
 
-**A wrong conclusion, corrected.** It was first written up that the chair
-beat the person *because an empty chair is nearer the camera than the person
-who sits in it* - 2.20 m against 3.19 m. The user pointed out that this is
-backwards: sitting in a chair puts you in front of its back. They were right.
-Comparing the two captures shows the chair had been rolled well forward
-between them, so in that frame it genuinely was nearer, and the user was also
-still visible at the right edge. **Capture B was not a clean control**, and
-the 0.951-versus-0.767 comparison says nothing about whether a score floor
-could detect an empty seat.
+**Two wrong explanations, and then the measurement.** The chair scoring
+higher than the person was first explained as *an empty chair being nearer
+the camera than its occupant*. The user pointed out that this is backwards -
+sitting in a chair puts you in front of its back. The second explanation was
+that the chair must have been rolled forward between captures. The user said
+it had not moved. Both were guesses dressed as conclusions.
 
-The lesson is the familiar one in this project: the scene has to be held
-fixed for a comparison to mean anything, and "the numbers came out this way"
-is not a mechanism. A proper control is to sit, capture, then stand and step
-aside **without moving the chair**.
+Probing identical pixels in the two frames settles it. On five points of
+static scenery - wall, curtain, doorway, none of which can have moved - the
+second frame reads **0.19 to 0.32 m nearer** than the first, consistently.
+That is the model's absolute scale drifting between two inferences of an
+unchanged room. And at the centre-bottom pixel, where the person was and then
+was not, the first frame reads **3.096 m** (their chest) and the second
+**2.148 m** (the chair back behind where they sat). Correcting for the global
+offset the chair is still about **0.68 m nearer than the chest of the person
+sitting in front of it**. A chair back is not 68 cm in front of its occupant.
+**The sign is wrong, not just the magnitude.**
 
-Whether a score floor can distinguish an occupied seat from an empty one is
-therefore still **open**. The prior remains that it cannot, since a chair in
-the subject position shares every feature the scoring measures - but that is
-now an expectation rather than a result.
+So the real finding is not about chairs at all:
+
+And the absolute scale is not merely drifting, it is wrong outright: the
+subject was sitting **under a metre** from the camera and was reported at
+3.10 m, with the near plane at 2.46 m - out by about **3x**. That fits the
+model's training distribution, which is synthetic room-scale architecture
+rather than close-up portraits; a head filling the frame at 70 cm is nothing
+like anything it was trained on, so it reads the scene as a larger room
+viewed from further away.
+
+**The model's absolute depth is not trustworthy - wrong by roughly 3x, not
+stable across frames, and locally wrong by more than the geometry it is
+describing.** It produces
+numbers of roughly the right magnitude that are internally plausible, which
+is a much weaker property than being metric. Calling it a metric model, as
+this plan did, was overstating it.
+
+What that does and does not break:
+
+- **Fine.** Everything anchored to the scene's own reported range rather than
+  to absolute values: the light distance slider, the falloff scale, shadow
+  thickness and bias, the subject band, and the scoring's proximity term. All
+  of these are relative, so a global offset moves them together.
+- **Affected but tolerable.** The reconstruction is uniformly scaled, and
+  normals, shadow shapes and the falloff ratio are all scale-invariant, so
+  the picture is unaffected. The residual is that the drift is closer to an
+  offset than a clean scale factor, which distorts the geometry slightly.
+- **Wrong, and fixed here.** The controls were labelled in metres, which
+  presented a fabricated distance to the user as though it were measured.
+  They now read in relative units for model-derived depth, and in metres only
+  for the synthetic scenes, where the figure is genuinely known.
+- **Not viable.** Comparing scores between frames, which is exactly what a
+  "no subject found" floor would have to do. That idea is now closed rather
+  than open: the score depends on absolute depth through its proximity term,
+  and absolute depth is the part that is unreliable.
+
+Whether an occupied seat can be told from an empty one is therefore not a
+tuning problem. It needs a person or face model, or a temporal cue such as
+motion - not a better heuristic over these depths.
 
 Also added `--grab-frame <out.png> [preset]`, so one pose can be captured at
 several resolutions and every later analysis run against the same file, and

@@ -178,12 +178,18 @@ from an actual depth map and the light positioned in metres in camera space.
 
 In depth mode the height slider becomes a **distance** slider - how far the
 light is from the camera - so pushing it past the subject is what puts the
-light behind them. That produces a silhouette with a rim along the lit edge,
+light behind them. It reads in metres for the test scenes, where the distance
+is genuinely known, and in relative units (`u`) for the depth model, whose
+absolute scale measured about 3x out here. That produces a silhouette with a rim along the lit edge,
 and, with shadows on, a shadow cast onto the wall behind.
 
 The live webcam feed gets its depth from a monocular depth model
 (Depth-Anything-V2-Metric-Hypersim-Small, Apache-2.0) run through ONNX
 Runtime on the GPU via DirectML, on its own thread at roughly 22 ms a frame.
+Its output is in metre-like units but is not reliably metric - measured here,
+the same static scenery moves by up to 0.3 m between frames - so every
+parameter that depends on scale is derived from the scene's own reported
+range rather than from absolute values. See [FINDINGS.md](FINDINGS.md).
 The model is about 99 MB and is not in this repository - fetch it once with
 `powershell -File tools/get-depth-model.ps1`, and until then depth mode says
 why it is unavailable.

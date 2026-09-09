@@ -192,12 +192,30 @@ and likewise for streams.
   back read as a head and shoulders in depth, and it is near, central, large
   and running out of the bottom of frame - every feature the scoring rewards.
   Separating a chair from a person needs an actual person or face model.
-- **Hold the scene fixed, or a before-and-after comparison means nothing.**
-  An empty-chair capture here was taken after the chair had been rolled
-  forward, which made it nearer than the person had been and produced a
-  confident but worthless conclusion about why it scored higher. If the
-  control condition changed more than the one variable, the numbers are not
-  evidence.
+- **A "metric" monocular model's absolute scale can simply be wrong, by a
+  lot.** Measured here: a subject sitting under 1 m from the webcam was
+  reported at 3.10 m, with the scene's near plane at 2.46 m - out by roughly
+  3x. The likely reason is the training distribution:
+  Depth-Anything-V2-Metric-Hypersim is trained on synthetic *room-scale
+  architecture*, and a head filling the frame at 70 cm is nothing like that,
+  so it reads the scene as a larger room viewed from further back. Never
+  present these numbers to a user as real distances.
+- **A "metric" monocular model's absolute depth is not trustworthy.**
+  Measured on two frames of the same room: five static points (wall, curtain,
+  doorway) read 0.19 to 0.32 m nearer in one frame than the other, so the
+  global scale drifts between inferences. Worse, at one pixel a chair back
+  read 0.68 m *nearer* than the chest of the person who had been sitting in
+  front of it - the sign is wrong, not just the magnitude. Use these depths
+  for relative structure, and derive every parameter from the scene's own
+  reported range; do not compare absolute values across frames, and do not
+  build a decision on one.
+- **Do not explain a surprising number until you have measured why.** Two
+  confident explanations were offered for a chair outscoring a person - that
+  empty chairs are nearer than their occupants, and that the chair had been
+  moved - and both were wrong, the first physically backwards and the second
+  contradicted by the user. Probing identical pixels in both frames took a
+  few minutes and gave the actual answer, which was about the model rather
+  than the scene.
 - **A monocular model's input size caps the depth resolution, so a higher
   capture resolution does not improve depth.** Measured from 1080p to 4K: the
   depth map stays 518 wide, the mask changes by 0.1% of frame, and the depth

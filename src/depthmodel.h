@@ -6,9 +6,16 @@
 // Monocular depth estimation, so the live webcam feed has real geometry.
 //
 // Runs Depth-Anything-V2-Metric-Hypersim-Small through ONNX Runtime with the
-// DirectML provider. The metric variant matters: it outputs depth in metres,
-// which is what the renderer's camera model already works in, rather than the
-// unitless inverse depth the base models produce.
+// DirectML provider. The metric variant is worth using because it outputs
+// depth in metre-like units, which the renderer's camera model can consume
+// directly, rather than the unitless inverse depth the base models produce.
+//
+// It is not reliably metric, though. Measured on two frames of one unchanged
+// room, static scenery moved by up to 0.3 m between inferences, and at one
+// pixel a chair back read 0.68 m nearer than the chest of the person who had
+// been sitting in front of it. Treat the output as relative structure with a
+// plausible scale: derive parameters from the range the source reports, and
+// never compare absolute values between frames.
 //
 // Inference is about 22 ms on an RX 7800 XT, so it runs on its own thread and
 // the renderer keeps its frame rate regardless. Nothing here includes raylib:
