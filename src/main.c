@@ -400,6 +400,53 @@ static int VerifyNormals(RelightShader rs, DepthScene which, int width, int heig
 }
 
 
+
+// Saves one raw webcam frame, so a test can be run against a known picture.
+//
+// Worth having as a mode rather than a screenshot: a screenshot of the app is
+// already relit, and judging the subject mask needs the frame the model
+// actually sees. It also means a calibration run can be agreed in advance -
+// the person in front of the camera knows when it is being taken.
+static int GrabWebcamFrame(const char *outPath, int settleFrames)
+{
+    if (!InitWebcamSystem()) { printf("GRAB: no Media Foundation\n"); return 1; }
+
+    Image frame = { 0 };
+    Texture2D unused = { 0 };
+    if (!ReopenWebcam(0, 1, &frame, &unused))
+    {
+        printf("GRAB: could not open the camera\n");
+        ShutdownWebcamSystem();
+        return 1;
+    }
+    if (unused.id != 0) UnloadTexture(unused);
+
+    // Let exposure and white balance settle. A frame grabbed the instant the
+    // camera opens is darker and noisier than what the user is looking at.
+    int got = 0;
+    for (int attempt = 0; (attempt < 400) && (got < settleFrames); attempt++)
+    {
+        if (UpdateWebcamFrame((unsigned char *)frame.data)) got++;
+        else WaitTime(0.01);
+    }
+
+    if (got == 0)
+    {
+        printf("GRAB: no frames arrived\n");
+        CloseWebcam();
+        ShutdownWebcamSystem();
+        return 1;
+    }
+
+    ExportImage(frame, outPath);
+    printf("GRAB: %dx%d after %d frames -> %s\n", frame.width, frame.height, got, outPath);
+
+    UnloadImage(frame);
+    CloseWebcam();
+    ShutdownWebcamSystem();
+    return 0;
+}
+
 // Runs the depth model over one saved image and writes out what it produced.
 //
 // This exists because the subject mask cannot be judged against a live camera:
@@ -482,6 +529,7 @@ int main(int argc, char **argv)
     // A leading flag is not a photo path.
     bool verifyOnly = (argc > 1) && (TextIsEqual(argv[1], "--verify-normals"));
     bool depthImageOnly = (argc > 3) && (TextIsEqual(argv[1], "--depth-image"));
+    bool grabOnly = (argc > 2) && (TextIsEqual(argv[1], "--grab-frame"));
     const char *photoPath = ((argc > 1) && (argv[1][0] != '-')) ? argv[1]
                                                                 : ASSET_DIR "/portrait.png";
 
@@ -517,6 +565,14 @@ int main(int argc, char **argv)
     SetTextureFilter(photoTexture, TEXTURE_FILTER_BILINEAR);
 
     RelightShader rs = LoadRelightShader();
+
+    if (grabOnly)
+    {
+        int result = GrabWebcamFrame(argv[2], 45);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return result;
+    }
 
     if (depthImageOnly)
     {
@@ -798,7 +854,10 @@ int main(int argc, char **argv)
         }
 
         // Follow the source until the slider is touched, then leave it alone.
-        if (reliefFollowsSource) depthRelief = (syntheticIndex >= 0) ? 1.0f : 0.30f;
+        // 0.02 for the model, measured rather than guessed: at anything
+        // higher the noise in its depth gradient dominates and the subject
+        // looks crinkled. Exact synthetic depth wants the full tilt.
+        if (reliefFollowsSource) depthRelief = (syntheticIndex >= 0) ? 1.0f : 0.02f;
 
         // The scene's own range drives the light distance slider, the depth
         // view mapping and the falloff scale.
@@ -1082,7 +1141,7 @@ int main(int argc, char **argv)
             }
             float beforeRelief = depthRelief;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Relief",
-                         TextFormat("%.2f", depthRelief), &depthRelief, 0.02f, 1.0f);
+                         TextFormat("%.2f", depthRelief), &depthRelief, 0.0f, 1.0f);
             if (depthRelief != beforeRelief) reliefFollowsSource = false;
             y += rowStep;
             GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Depth taps",

@@ -179,6 +179,12 @@ float hash12(vec2 p)
 // silhouette shadows everything behind it forever; with it, a light between
 // the subject and the wall still throws a shadow but distant geometry stops
 // being blocked by anything that merely overlaps it on screen.
+//
+// Only the subject casts. Letting the whole room occlude means a lamp, a
+// doorway or a curtain at a completely different depth sweeps a shadow across
+// the subject as the light moves, which reads as shadows appearing in the
+// room at random. Their own shadows were never visible anyway - the mask
+// blends the background back to the original frame - so nothing is lost.
 float shadowFactor(vec3 P, vec3 L, float lightDist)
 {
     if (shadowSteps <= 0) return 1.0;
@@ -212,6 +218,8 @@ float shadowFactor(vec3 P, vec3 L, float lightDist)
 
         float sceneZ = depthAt(uv);
         if (sceneZ <= 0.0) continue;    // no data is not an occluder
+        // Nor is anything outside the subject.
+        if ((maskEnabled == 1) && (texture(subjectMask, uv).r < 0.5)) continue;
 
         float penetration = S.z - sceneZ;
         if ((penetration > shadowBias) && (penetration < shadowThickness)) occluded += 1.0;
