@@ -900,6 +900,63 @@ Controls: **Subject only** on by default, **Subject depth** for the band, and
 **Spill** to let some light reach beyond the subject when a hard cut looks
 wrong.
 
+#### D4 - calibration against real frames (2026-09-09)
+
+Two captures agreed with the user in advance, which is the process from here:
+announce what a capture is for and what pose is needed, then wait. Several
+earlier mask evaluations were taken unannounced and one was of an empty
+chair, which says nothing about a person detector.
+
+**Does a higher capture resolution help? No.** Same pose grabbed at 1080p and
+4K:
+
+| | 1080p | 4K |
+| --- | --- | --- |
+| depth map | 518x291 | 518x291 |
+| range | 2.455 to 7.187 m | 2.365 to 7.041 m |
+| mask coverage | 9.2% | 9.1% |
+| inference | 44.3 ms | 44.6 ms |
+| depth gradient noise | 2.502 | 2.403 |
+
+The model's input is a fixed 518 square, so the depth map's size cannot
+change. The last row is the only thing that could have justified 4K - mean
+absolute Laplacian of the depth map, a proxy for the high-frequency wobble
+normals are made from - and it is 4% smoother. Real, and far too small to
+matter, or to let relief rise above 0.02. **Stay on 1080p**; 33 MB a frame is
+not worth 4%. The presets remain for output sharpness.
+
+**With nobody in frame, the office chair is selected**, scoring 0.951 with a
+mask very nearly the shape of a person: the headrest and back read as a head
+and shoulders in depth, and the chair is near, central, large and running out
+of the bottom of frame - every feature the scoring rewards. So the selector
+is a nearest-central-object selector, and the code and docs now say so rather
+than calling it a person detector.
+
+**A wrong conclusion, corrected.** It was first written up that the chair
+beat the person *because an empty chair is nearer the camera than the person
+who sits in it* - 2.20 m against 3.19 m. The user pointed out that this is
+backwards: sitting in a chair puts you in front of its back. They were right.
+Comparing the two captures shows the chair had been rolled well forward
+between them, so in that frame it genuinely was nearer, and the user was also
+still visible at the right edge. **Capture B was not a clean control**, and
+the 0.951-versus-0.767 comparison says nothing about whether a score floor
+could detect an empty seat.
+
+The lesson is the familiar one in this project: the scene has to be held
+fixed for a comparison to mean anything, and "the numbers came out this way"
+is not a mechanism. A proper control is to sit, capture, then stand and step
+aside **without moving the chair**.
+
+Whether a score floor can distinguish an occupied seat from an empty one is
+therefore still **open**. The prior remains that it cannot, since a chair in
+the subject position shares every feature the scoring measures - but that is
+now an expectation rather than a result.
+
+Also added `--grab-frame <out.png> [preset]`, so one pose can be captured at
+several resolutions and every later analysis run against the same file, and
+per-region score printing behind `SetDepthModelVerbose` for working out why a
+frame chose what it did.
+
 #### Expectation to set now
 
 Everything in phases A to C was judged against perfect synthetic depth with

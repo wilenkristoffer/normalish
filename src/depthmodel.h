@@ -58,4 +58,13 @@ bool GetDepthRange(float *nearMetres, float *farMetres);
 // behind them, because the two are connected through the floor.
 void SetSubjectBand(float metres);
 
+// Prints per-region scores while choosing the subject. For working out why a
+// frame picked the region it did; off in normal use.
+void SetDepthModelVerbose(bool on);
+
+// The winning region's score. A frame with no subject in it still produces a
+// winner, so this is how "found nothing convincing" can be told apart from
+// "found someone".
+double GetSubjectScore(void);
+
 #endif

@@ -187,6 +187,21 @@ and likewise for streams.
   score them; the test that does the most work is penalising a region that
   covers most of the frame height at one side, which is what a curtain, wall
   or door frame looks like.
+- **Nor is region scoring a person detector.** With nobody in frame, the
+  office chair in the subject position is what gets selected: its headrest and
+  back read as a head and shoulders in depth, and it is near, central, large
+  and running out of the bottom of frame - every feature the scoring rewards.
+  Separating a chair from a person needs an actual person or face model.
+- **Hold the scene fixed, or a before-and-after comparison means nothing.**
+  An empty-chair capture here was taken after the chair had been rolled
+  forward, which made it nearer than the person had been and produced a
+  confident but worthless conclusion about why it scored higher. If the
+  control condition changed more than the one variable, the numbers are not
+  evidence.
+- **A monocular model's input size caps the depth resolution, so a higher
+  capture resolution does not improve depth.** Measured from 1080p to 4K: the
+  depth map stays 518 wide, the mask changes by 0.1% of frame, and the depth
+  gradient is 4% smoother. Worth doing only for output sharpness.
 
 ## Build
 

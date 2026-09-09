@@ -58,6 +58,10 @@ static float resultNear = 0.0f, resultFar = 0.0f;
 // sitting in is well under a metre; beyond that the growth starts reaching
 // the room behind them.
 static float subjectBand = 0.9f;
+// Off in normal use: this prints per-region scores, which is only wanted when
+// working out why a particular frame chose the region it did.
+static bool verboseMask = false;
+static double lastWinningScore = 0.0;
 static volatile LONG lastInferenceMicros = 0;
 
 static void SetStatus(const char *text)
@@ -106,9 +110,20 @@ static bool Failed(OrtStatus *status, const char *what)
 // else near the camera becomes its own region rather than joining the
 // subject.
 //
-// Regions are then scored for looking like a person in a webcam shot: near,
-// reasonably large, running out of the bottom of frame, and not a slab
+// Regions are then scored on being near, a reasonable share of the frame,
+// running out of the bottom of frame, roughly central, and not a slab
 // covering the full height at one side. That last test rejects curtains.
+//
+// This is a nearest-central-object selector, not a person detector. On a
+// frame with nobody in it, the office chair in the subject position is what
+// gets picked: its headrest and back read as a head and shoulders in depth,
+// and it is near, central, large and running out of the bottom of frame -
+// every feature the scoring rewards.
+//
+// That is accepted rather than worked around. Lighting the chair someone just
+// left is benign and roughly where the light belongs anyway, and telling a
+// chair from a person needs an actual person or face model, not a better
+// heuristic over depth.
 //
 // Runs at the depth map's own resolution, about 150k pixels, so it is cheap
 // enough to redo on every inference.
@@ -243,8 +258,22 @@ static void ComputeSubjectMask(int w, int h, float bandMetres)
         double centre = 1.0 - 0.45*centreOffset;
 
         double score = proximity*areaFactor*bottom*side*centre;
+
+        if (verboseMask)
+        {
+            printf("    region %2d: area %5.1f%%  depth %5.2f m  bottom %s  "
+                   "side %4d  centreX %.2f  -> score %.3f\n",
+                   i, 100.0*(double)r->area/(double)count, meanDepth,
+                   r->touchesBottom ? "yes" : "no ", sideRun,
+                   (r->sumX/(double)r->area)/(double)w, score);
+        }
+
         if (score > bestScore) { bestScore = score; best = i; }
     }
+
+    lastWinningScore = bestScore;
+    if (verboseMask)
+        printf("    winner    : region %d, score %.3f\n", best, bestScore);
 
     memset(maskBuffer, 0, count);
     if (best < 0) return;
@@ -607,6 +636,9 @@ void SubmitDepthFrame(const unsigned char *rgba, int width, int height)
     LeaveCriticalSection(&lock);
     SetEvent(frameReady);
 }
+
+void SetDepthModelVerbose(bool on) { verboseMask = on; }
+double GetSubjectScore(void) { return lastWinningScore; }
 
 void SetSubjectBand(float metres)
 {

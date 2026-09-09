@@ -460,6 +460,7 @@ static int GrabWebcamFrame(const char *outPath, int mode, int settleFrames)
 // does rather than a parallel copy of it.
 static int RunDepthOnImage(const char *path, const char *outPrefix)
 {
+    SetDepthModelVerbose(true);
     if (!InitDepthModel())
     {
         printf("DEPTH-IMAGE: %s\n", GetDepthModelStatus());
@@ -502,6 +503,7 @@ static int RunDepthOnImage(const char *path, const char *outPrefix)
     long long covered = 0;
     for (size_t i = 0; i < count; i++) if (mask[i] > 127) covered++;
     printf("  mask       : %.1f%% of the frame\n", 100.0*(double)covered/(double)count);
+    printf("  score      : %.3f\n", GetSubjectScore());
 
     // Near is white, so the visualisation matches the in-app depth view.
     unsigned char *grey = (unsigned char *)RL_MALLOC(count);
