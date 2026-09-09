@@ -544,22 +544,56 @@ void SubmitDepthFrame(const unsigned char *rgba, int width, int height)
     // would try to explain.
     memset(pendingInput, 0, (size_t)3*SIDE*SIDE*sizeof(float));
 
+    // Average over each output pixel's source footprint rather than picking
+    // one sample from the middle of it. Point sampling a 1280-wide frame down
+    // to 518 already aliases; from 4K it is a 7x reduction and the model would
+    // be handed a frame full of aliasing artefacts that are not in the scene.
+    // Averaging instead cuts sensor noise roughly with the square root of the
+    // number of samples, so a higher capture resolution genuinely helps here.
+    //
+    // The tap count per output pixel is capped, so the cost is bounded by the
+    // model's input size instead of growing with the camera's resolution -
+    // this runs on the render thread.
+    const int maxTaps = 4;
+
     for (int y = 0; y < fitH; y++)
     {
-        int sy = (int)((y + 0.5f)/scale);
-        if (sy >= height) sy = height - 1;
-        const unsigned char *row = rgba + (size_t)sy*width*4;
+        int sy0 = (int)(y/scale);
+        int sy1 = (int)((y + 1)/scale);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > height) sy1 = height;
+        int stepY = ((sy1 - sy0) + maxTaps - 1)/maxTaps;
+        if (stepY < 1) stepY = 1;
 
         for (int x = 0; x < fitW; x++)
         {
-            int sx = (int)((x + 0.5f)/scale);
-            if (sx >= width) sx = width - 1;
-            const unsigned char *p = row + (size_t)sx*4;
+            int sx0 = (int)(x/scale);
+            int sx1 = (int)((x + 1)/scale);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > width) sx1 = width;
+            int stepX = ((sx1 - sx0) + maxTaps - 1)/maxTaps;
+            if (stepX < 1) stepX = 1;
+
+            int sum[3] = { 0, 0, 0 };
+            int taps = 0;
+            for (int sy = sy0; sy < sy1; sy += stepY)
+            {
+                const unsigned char *row = rgba + (size_t)sy*width*4;
+                for (int sx = sx0; sx < sx1; sx += stepX)
+                {
+                    const unsigned char *p = row + (size_t)sx*4;
+                    sum[0] += p[0];
+                    sum[1] += p[1];
+                    sum[2] += p[2];
+                    taps++;
+                }
+            }
+            if (taps == 0) continue;
 
             for (int c = 0; c < 3; c++)
             {
                 size_t index = (size_t)c*SIDE*SIDE + (size_t)(y + offY)*SIDE + (x + offX);
-                pendingInput[index] = (p[c]/255.0f - kMean[c])/kStd[c];
+                pendingInput[index] = ((float)sum[c]/(float)taps/255.0f - kMean[c])/kStd[c];
             }
         }
     }

@@ -159,9 +159,13 @@ static bool TrackBrightestPoint(Image frame, int step, Vector2 *point)
 
 // Capture resolutions offered in the UI. The camera decides what it can
 // actually deliver, so the panel reports the mode it settled on.
-static const int captureWidths[] = { 640, 1280, 1920 };
-static const int captureHeights[] = { 480, 720, 1080 };
-static const char *captureModeList = "480p;720p;1080p";
+// A higher capture resolution does not improve the depth map - the model's
+// input is a fixed 518 square, so everything above that is downscaled before
+// inference. It does sharpen the output picture, and with the input properly
+// area-averaged it also hands the model a cleaner frame.
+static const int captureWidths[] = { 640, 1280, 1920, 2560, 3840 };
+static const int captureHeights[] = { 480, 720, 1080, 1440, 2160 };
+static const char *captureModeList = "480p;720p;1080p;1440p;4K";
 
 // Opens (or reopens) a camera and rebuilds the frame buffer and texture for
 // it, since a different device or mode can mean a different frame size. Used
@@ -407,13 +411,13 @@ static int VerifyNormals(RelightShader rs, DepthScene which, int width, int heig
 // already relit, and judging the subject mask needs the frame the model
 // actually sees. It also means a calibration run can be agreed in advance -
 // the person in front of the camera knows when it is being taken.
-static int GrabWebcamFrame(const char *outPath, int settleFrames)
+static int GrabWebcamFrame(const char *outPath, int mode, int settleFrames)
 {
     if (!InitWebcamSystem()) { printf("GRAB: no Media Foundation\n"); return 1; }
 
     Image frame = { 0 };
     Texture2D unused = { 0 };
-    if (!ReopenWebcam(0, 1, &frame, &unused))
+    if (!ReopenWebcam(0, mode, &frame, &unused))
     {
         printf("GRAB: could not open the camera\n");
         ShutdownWebcamSystem();
@@ -568,7 +572,12 @@ int main(int argc, char **argv)
 
     if (grabOnly)
     {
-        int result = GrabWebcamFrame(argv[2], 45);
+        // Optional third argument is the capture preset index, so the same
+        // pose can be grabbed at more than one resolution.
+        int mode = (argc > 3) ? atoi(argv[3]) : 2;
+        int presets = (int)(sizeof(captureWidths)/sizeof(captureWidths[0]));
+        if ((mode < 0) || (mode >= presets)) mode = 2;
+        int result = GrabWebcamFrame(argv[2], mode, 45);
         UnloadShader(rs.shader);
         CloseWindow();
         return result;
