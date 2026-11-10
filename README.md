@@ -73,6 +73,8 @@ normalish/
   src/vcam/        Media Foundation media source DLL (C++)
   shaders/         GLSL fragment shaders
   assets/          input photos
+  docs/            pictures for this README
+  tools/           scripts that fetch the models and record test clips
   build/           generated - build output and fetched raylib (not tracked)
 ```
 
@@ -82,6 +84,10 @@ All five planned phases complete. A movable point light relights either a
 still photo or the live webcam feed in real time, at 60 FPS, with a control
 panel for tuning the look. See [PLAN.md](PLAN.md) for the phase-by-phase
 record, including where the plan turned out to be wrong.
+
+Since then, experimentally: the live feed can be lit in real depth, from
+behind as well, with the light itself visible. See
+[Depth geometry](#depth-geometry-experimental).
 
 ## Webcam
 
@@ -167,6 +173,105 @@ rough proxy for depth. Hard side light bakes a direction into the derived
 "geometry" and fights the light you are trying to move; glare and glossy
 highlights become permanent fake bumps; and glasses are the worst offender
 because lens reflections read as raised blobs.
+
+## Depth geometry (experimental)
+
+The **Geometry** switch chooses how the surface is derived. *Luminance* is the
+original model and the only one for the photo: the image is a flat
+plane, brightness stands in for height, and the viewer is orthographic.
+*Depth* treats the image as a real perspective surface, with normals taken
+from an actual depth map and the light positioned in metres in camera space.
+
+In depth mode the height slider becomes a **distance** slider - how far the
+light is from the camera - so pushing it past the subject is what puts the
+light behind them. It reads in metres for the test scenes, where the distance
+is genuinely known, and in relative units (`u`) for the depth model, whose
+absolute scale measured about 3x out here. On the test scenes that produces
+a silhouette with a rim along the lit edge and a shadow cast onto the wall
+behind; on the live feed see Backlight below.
+
+The live webcam feed gets its depth from a monocular depth model
+(Depth-Anything-V2-Metric-Hypersim-Small, Apache-2.0) run through ONNX
+Runtime on the GPU via DirectML, on its own thread at roughly 22 ms a frame.
+Its output is in metre-like units but is not reliably metric - measured here,
+the same static scenery moves by up to 0.3 m between frames - so every
+parameter that depends on scale is derived from the scene's own reported
+range rather than from absolute values. See [FINDINGS.md](FINDINGS.md).
+The model is about 99 MB and is not in this repository - fetch it once with
+`powershell -File tools/get-depth-model.ps1`, and until then depth mode says
+why it is unavailable.
+
+**Subject only** is on by default: the light is applied to you, and the room
+behind you is blended toward its lit version by **Room light** (0 leaves it
+exactly as the camera saw it). Relighting the whole frame means relighting
+curtains and furniture, where the depth model is least reliable and the
+artefacts are worst. Shadows fall on the person only, for the same reason.
+
+The person is found by two MediaPipe selfie segmentation models (Apache-2.0),
+combined with the depth map: one is good at torso and shoulders, the other
+at head, hair and hands, and neither is enough alone. They are 0.5 MB and
+16.5 MB, cost about 6 ms per depth result on the depth thread, and are
+fetched once with `powershell -File tools/get-person-models.ps1`. Without
+them the subject is guessed from the depth map alone (nearest central
+region, with a **Subject depth** slider), which is not a person detector:
+with nobody in frame it lights the office chair.
+
+### Backlight
+
+![The bundled portrait with the light carried once round the head](docs/backlight.gif)
+
+*The bundled photo with the light carried once round the head: behind it,
+where the head hides the disc and the glow spills over the outline with a
+rim along the hair, out to the side, over the top in front, and back.
+Rendered by replaying the photo as a clip (`--clip-from-image`, then
+`--analyse-clip ... sweep`), which is the same path the live feed takes;
+the frames were joined into a GIF with ffmpeg, which the app itself does
+not use.*
+
+Push **Distance** past yourself and the light goes behind you. The light is
+drawn as a disc with a glow (**Source glow**, **Source size**), the person
+hides it, the glow spills over their outline (**Spill**) and the outline
+nearest the light gets a rim (**Rim light**). Only the person hides the
+light; the room never does, because the model's depth for a curtain or a
+wall is not good enough to say which side of it a light is on.
+
+What it does not do well, measured on recorded clips and judged live:
+
+- A backlit person is close to black, as they would be. Raise **Ambient**.
+- Loose hair outside the mask is neither hidden behind nor rimmed.
+- A fast-moving hand is only partly found, so the light shows through it
+  and it is lit unevenly.
+- Someone with their back turned at the edge of the frame is not found and
+  is left unlit.
+- The shadows on the person are steady when sitting still and get rougher
+  with movement; with the light placed inside the head, the top of the head
+  goes dark.
+
+It holds 60 FPS at 720p and 1080p on an RX 7800 XT (16.7 ms a frame), with
+depth arriving about 22 times a second. [PLAN.md](PLAN.md) has the numbers
+stage by stage, including the conclusions that turned out to be wrong.
+
+Capture resolution does not affect depth quality - the model's input is a
+fixed 518 square - so 1080p is the sensible choice. 1440p and 4K are offered
+for output sharpness; measured against 1080p, 4K makes the depth gradient 4%
+smoother and changes nothing else.
+
+The two **Test** sources are analytic scenes (a
+sphere, and a head with shoulders, both on a wall) generated by ray tracing
+them in [src/depth.c](src/depth.c), which exist so the renderer could be
+built and checked before choosing how to produce depth from a camera. Run
+`normalish --verify-normals` to compare the shader's normals against the
+scenes' exact normals; interior error is about 0.3 degrees, which is the
+8-bit readback floor. `normalish --depth-image <in.png> <out-prefix>` runs the
+model over a saved frame and writes out the depth map and subject mask, which
+is the repeatable way to check those without depending on what the camera
+happens to be pointing at.
+
+A depth map is 2.5D - one depth per pixel, from the camera's viewpoint - so
+a light behind the subject cannot illuminate the back of their head, because
+no camera ever saw it. The rim and the spill are drawn from the person's
+outline instead. See [PLAN.md](PLAN.md) for the candidate depth sources that
+were weighed.
 
 ## Virtual camera
 

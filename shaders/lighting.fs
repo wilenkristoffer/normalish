@@ -11,7 +11,62 @@ uniform vec2 texelSize;       // 1.0 / source texture size, for the Sobel taps
 uniform float relief;         // how pronounced the derived relief is
 uniform float sampleSpacing;  // tap distance in texels; larger ignores fine detail
 
-uniform vec3 lightPos;   // surface units: x in 0..aspect, y in 0..1, z above surface
+// Geometry model: 0 = luminance relief (flat plane, orthographic viewer, the
+// original), 1 = a real depth map with a perspective camera. The two use
+// different spaces, and lightPos is supplied in whichever one is active.
+uniform int geometryMode;
+
+uniform sampler2D depthMap;   // R channel: metres along the view axis, 0 = no data
+uniform float tanHalfFovX;    // tan of half the horizontal field of view
+uniform float depthSpacing;   // tap distance in depth texels for the gradient
+// The depth map's own texel size, which is not the albedo's: the model returns
+// 518 wide against a 1280-wide frame. Tapping the gradient at albedo spacing
+// samples well inside a single depth texel, where the bilinear interpolation
+// is piecewise linear, and the normals then follow the interpolation grid
+// rather than the surface.
+uniform vec2 depthTexelSize;
+// How much of the measured surface tilt to keep, 1 = all of it. Exact depth
+// needs none of this, but a monocular model is trained for depth accuracy
+// rather than gradient accuracy: its surfaces undulate by centimetres, and at
+// room scale one depth texel spans only millimetres of scene, so a small
+// depth error becomes a large tilt. Attenuating the tilt trades some real
+// shape for normals that are not dominated by that error.
+uniform float depthRelief;
+
+// Which pixels are the subject.
+//
+// The subject is shaded with the measured normal. The room is shaded with a
+// flat normal facing the camera instead, which is the point of the split: the
+// artefacts that made relighting the whole frame unusable came from the
+// model's noisy depth gradients, not from the light itself. With a flat
+// normal the room still gets distance falloff and a smooth pool of light, so
+// the light stays visible as it moves around the scene, and there is no
+// gradient left to go wrong.
+uniform sampler2D subjectMask;
+uniform int maskEnabled;      // 0 shades everything with measured normals
+uniform float roomLight;      // how strongly the light reaches the room, 0 = not at all
+uniform vec2 depthRange;      // near/far of the source, for the depth view
+// Distance at which falloff is measured, so one falloff setting means the
+// same thing whether the scene is a synthetic head at 0.6 m or a real room
+// running to 8 m. 1.0 in luminance mode, which leaves that model untouched.
+uniform float distanceScale;
+
+uniform int shadowSteps;        // 0 disables the shadow march
+uniform float shadowBias;       // metres; below this a surface shadows itself
+uniform float shadowThickness;  // metres an occluder is assumed to extend back
+uniform int shadowSource;       // 0 = march here, 1 = read shadowTex
+uniform sampler2D shadowTex;    // R: 1 lit, 0 shadowed, from the shadow pass
+uniform float terminatorWrap;   // how far past 90 degrees light reaches the subject
+
+// How the light itself is drawn, depth mode only:
+//   x  radius of the source, as a fraction of the scene's near distance
+//   y  brightness of the source and its glow, 0 = do not draw it
+//   z  how much of the glow spills over the person's outline, 0..1
+//   w  strength of the rim of light on the person's edge
+uniform vec4 sourceLook;
+
+uniform vec3 lightPos;   // luminance mode: x in 0..aspect, y in 0..1, z above
+                         // surface. depth mode: metres in camera space.
 uniform vec3 lightColor;
 uniform float lightIntensity;
 uniform float falloff;
@@ -19,7 +74,7 @@ uniform float ambient;
 uniform float specularStrength;
 uniform float shininess;
 uniform float aspect;
-uniform int viewMode;    // 0 = lit, 1 = normals, 2 = albedo only
+uniform int viewMode;    // 0 = lit, 1 = normals, 2 = albedo, 3 = depth, 4 = mask
 
 out vec4 finalColor;
 
@@ -53,28 +108,458 @@ vec3 computeNormal(vec2 uv)
     return normalize(vec3(-gx*relief, -gy*relief, 1.0));
 }
 
+// --- depth model -----------------------------------------------------------
+//
+// The camera sits at the origin looking down +z, so depth grows away from the
+// viewer and a surface facing the camera has a normal pointing at -z. Image
+// space has y = 0 at the top, so +y points down in 3D as well.
+
+float depthAt(vec2 uv)
+{
+    return texture(depthMap, uv).r;
+}
+
+// A deliberately blurred depth, for the room's lighting only.
+//
+// The room is shaded with a flat normal, so its gradient noise cannot reach
+// the shading - but the *distance* to the light still comes from the depth,
+// and the falloff amplifies noise there badly. Five wide taps keep the large
+// structure, which is all the room path needs, and drop the per-pixel wobble.
+float smoothDepthAt(vec2 uv)
+{
+    vec2 d = depthTexelSize*3.0;
+    float z = depthAt(uv);
+    if (z <= 0.0) return 0.0;
+
+    float sum = z;
+    float n = 1.0;
+    float taps[4] = float[4](
+        depthAt(uv + vec2( d.x, 0.0)),
+        depthAt(uv - vec2( d.x, 0.0)),
+        depthAt(uv + vec2( 0.0, d.y)),
+        depthAt(uv - vec2( 0.0, d.y)));
+    for (int i = 0; i < 4; i++)
+    {
+        if (taps[i] > 0.0) { sum += taps[i]; n += 1.0; }
+    }
+    return sum/n;
+}
+
+// A depth sample back to the 3D point that produced it.
+vec3 depthPosition(vec2 uv)
+{
+    float z = depthAt(uv);
+    vec2 ndc = uv*2.0 - 1.0;
+    return vec3(ndc.x*tanHalfFovX*z, ndc.y*(tanHalfFovX/aspect)*z, z);
+}
+
+// Set by normalFromDepth: 1 where the depth around the texel looks like a
+// surface, falling to 0 where it is the smeared ramp of a depth step.
+float surfaceTrust = 1.0;
+
+// One axis of the surface gradient, as the better of the two one-sided
+// differences. Across a silhouette the far neighbour is metres away and would
+// dominate a central difference, tilting the normal into nonsense; taking
+// whichever side is nearer in depth keeps the estimate on the surface we are
+// actually standing on. Invalid neighbours are pushed out of contention.
+vec3 axisDelta(vec2 uv, vec3 P, float z, vec2 step)
+{
+    float zb = depthAt(uv - step);
+    float zf = depthAt(uv + step);
+
+    float db = (zb > 0.0) ? abs(z - zb) : 1.0e9;
+    float df = (zf > 0.0) ? abs(zf - z) : 1.0e9;
+    if ((db > 1.0e8) && (df > 1.0e8)) return vec3(0.0);
+
+    vec3 delta = (df <= db) ? (depthPosition(uv + step) - P)
+                            : (P - depthPosition(uv - step));
+
+    // Even the better side can be on a depth step. The depth map is small and
+    // stretched over the picture, so a step (head to wall, neck to collar) is
+    // smeared into a ramp a few texels wide, and a texel on the ramp has a
+    // steep difference on both sides. That is not a surface: nothing the
+    // camera can see is tilted more than about 80 degrees away from it. So the
+    // steeper the difference, the less of it is believed, and past a slope of
+    // 12 the texel is called flat along this axis. Without this the ramp
+    // texels got normals lying on their side, which faced away from any light
+    // in front and drew a black line along every depth step.
+    float slope = abs(delta.z)/max(length(delta.xy), 1.0e-6);
+    float believed = 1.0 - smoothstep(4.0, 12.0, slope);
+    delta.z *= believed;
+    surfaceTrust = min(surfaceTrust, believed);
+    return delta;
+}
+
+vec3 normalFromDepth(vec2 uv)
+{
+    float z = depthAt(uv);
+    if (z <= 0.0) return vec3(0.0, 0.0, -1.0);
+
+    vec2 d = depthTexelSize*max(depthSpacing, 1.0);
+    vec3 P = depthPosition(uv);
+
+    vec3 Px = axisDelta(uv, P, z, vec2(d.x, 0.0));
+    vec3 Py = axisDelta(uv, P, z, vec2(0.0, d.y));
+
+    vec3 n = cross(Py, Px);
+    float len = length(n);
+    if (len <= 1.0e-12) return vec3(0.0, 0.0, -1.0);
+    n /= len;
+
+    // A depth map only ever shows surfaces from the front. A normal pointing
+    // away from the camera is therefore always an error: it comes out of a
+    // surface seen nearly edge-on (a desk, the step from neck to collar),
+    // where depth falls so fast along the axis that the neighbouring point
+    // lands on the wrong side of this one and the cross product changes sign.
+    // Left alone those texels were lit from behind - thin black lines along
+    // every depth step inside the person, and speckle on edge-on surfaces.
+    if (n.z > 0.0) n = -n;
+
+    // Scaling the lateral components and renormalising rotates the normal
+    // toward the view axis without changing its direction in the image plane,
+    // so shape is softened rather than distorted.
+    n.xy *= depthRelief;
+    return normalize(n);
+}
+
+// The inverse of depthPosition: a camera-space point back to the pixel that
+// would have seen it.
+vec2 projectToUv(vec3 P)
+{
+    vec2 ndc = vec2(P.x/(tanHalfFovX*P.z), P.y/((tanHalfFovX/aspect)*P.z));
+    return ndc*0.5 + 0.5;
+}
+
+// Cheap per-pixel value in 0..1. Without it the march quantises every shadow
+// edge to a step length and the result is visibly banded.
+float hash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx)*0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y)*p3.z);
+}
+
+// Walk from the surface toward the light, projecting each step back to screen
+// space and asking the depth map whether anything is in front of it. Returns 1
+// for lit, 0 for shadowed.
+//
+// A depth map has no back face, so an occluder is assumed to be a slab of
+// shadowThickness rather than solid all the way to infinity. Without that a
+// silhouette shadows everything behind it forever; with it, a light between
+// the subject and the wall still throws a shadow but distant geometry stops
+// being blocked by anything that merely overlaps it on screen.
+//
+// Only the subject casts. Letting the whole room occlude means a lamp, a
+// doorway or a curtain at a completely different depth sweeps a shadow across
+// the subject as the light moves, which reads as shadows appearing in the
+// room at random. Their own shadows were never visible anyway - the mask
+// blends the background back to the original frame - so nothing is lost.
+float shadowFactor(vec3 P, vec3 L, float lightDist)
+{
+    if (shadowSteps <= 0) return 1.0;
+
+    // Cap the march relative to the scene rather than at a fixed distance:
+    // four times the nearest surface reaches past the back wall in both a
+    // synthetic head scene and a real room, whereas a fixed two metres would
+    // cover only the first quarter of a room-scale ray.
+    float span = min(lightDist, distanceScale*4.0);
+    float stepLen = span/float(shadowSteps);
+    float jitter = hash12(gl_FragCoord.xy);
+
+    // Occluded samples are counted rather than returned on immediately. A
+    // binary test plus jitter dithers every shadow edge into speckle; counting
+    // turns that same jitter into a gradient, which reads as a penumbra and
+    // costs nothing but the loss of the early exit.
+    float occluded = 0.0;
+
+    for (int i = 0; i < shadowSteps; i++)
+    {
+        float t = shadowBias + (float(i) + jitter)*stepLen;
+        if (t >= lightDist) break;
+
+        vec3 S = P + L*t;
+        if (S.z <= 0.0001) break;
+
+        vec2 uv = projectToUv(S);
+        // A straight ray projects to a straight line, so once it leaves the
+        // frame it will not come back and there is nothing more to test.
+        if ((uv.x < 0.0) || (uv.x > 1.0) || (uv.y < 0.0) || (uv.y > 1.0)) break;
+
+        float sceneZ = depthAt(uv);
+        if (sceneZ <= 0.0) continue;    // no data is not an occluder
+        // Nor is anything outside the subject.
+        float caster = (maskEnabled == 1) ? smoothstep(0.3, 0.7, texture(subjectMask, uv).r) : 1.0;
+
+        // How far the sample is behind the surface it projects onto. The two
+        // limits are ramps, not thresholds: the depth is noisy, and a sample
+        // sitting at a threshold flips between lit and shadowed from frame to
+        // frame, which is what made shadow edges jump.
+        float penetration = S.z - sceneZ;
+        float behind = smoothstep(shadowBias, shadowBias*4.0, penetration);
+        float within = 1.0 - smoothstep(shadowThickness*0.6, shadowThickness, penetration);
+        occluded += behind*within*caster;
+    }
+
+    // A quarter of the ray spent inside geometry is treated as fully
+    // shadowed; below that the transition is smooth.
+    float coverage = occluded/float(shadowSteps);
+    return 1.0 - smoothstep(0.0, 0.25, coverage);
+}
+
 void main()
 {
     vec3 albedo = texture(texture0, fragTexCoord).rgb*colDiffuse.rgb*fragColor.rgb;
-    vec3 normal = computeNormal(fragTexCoord);
 
-    // The surface is the z = 0 plane measured in units of its own height, so
-    // the light stays circular on a non-square image.
-    vec3 surfacePos = vec3(fragTexCoord.x*aspect, fragTexCoord.y, 0.0);
-    vec3 toLight = lightPos - surfacePos;
+    vec3 P;        // surface position, in whichever space the mode uses
+    vec3 normal;
+    vec3 V;        // surface to viewer
+
+    if (geometryMode == 1)
+    {
+        P = depthPosition(fragTexCoord);
+        normal = normalFromDepth(fragTexCoord);
+        // A real perspective viewer, so the specular highlight moves with
+        // position rather than sitting dead ahead everywhere.
+        V = (P.z > 0.0) ? normalize(-P) : vec3(0.0, 0.0, -1.0);
+    }
+    else
+    {
+        // The surface is the z = 0 plane measured in units of its own height,
+        // so the light stays circular on a non-square image.
+        P = vec3(fragTexCoord.x*aspect, fragTexCoord.y, 0.0);
+        normal = computeNormal(fragTexCoord);
+        V = vec3(0.0, 0.0, 1.0);   // orthographic viewer looking straight on
+    }
+
+    // How much of this pixel is subject. Outside it, swing the normal back to
+    // face the camera so the room is lit as though it were a flat surface at
+    // its measured depth - depth is reliable enough for distance, and it is
+    // the gradient that is not.
+    float subject = 1.0;
+    if ((geometryMode == 1) && (maskEnabled == 1))
+    {
+        subject = texture(subjectMask, fragTexCoord).r;
+        normal = normalize(mix(vec3(0.0, 0.0, -1.0), normal, subject));
+
+        // And take the room's position from the blurred depth, so the falloff
+        // distance is smooth there too.
+        float zSmooth = smoothDepthAt(fragTexCoord);
+        if (zSmooth > 0.0)
+        {
+            vec2 ndc = fragTexCoord*2.0 - 1.0;
+            float zUse = mix(zSmooth, P.z, subject);
+            P = vec3(ndc.x*tanHalfFovX*zUse, ndc.y*(tanHalfFovX/aspect)*zUse, zUse);
+        }
+    }
+
+    vec3 toLight = lightPos - P;
     float dist = length(toLight);
     vec3 L = toLight/max(dist, 0.0001);
-    vec3 V = vec3(0.0, 0.0, 1.0);   // orthographic viewer looking straight on
     vec3 H = normalize(L + V);
 
-    float atten = lightIntensity/(1.0 + falloff*dist*dist);
-    float diffuse = max(dot(normal, L), 0.0)*atten;
-    float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten;
+    // A point light has a singularity at zero distance, and the falloff's
+    // derivative is largest there - which is exactly where depth noise turns
+    // into speckle, and where placing the light on a surface blows it out.
+    // Clamping the distance to a fraction of the scene's near plane bounds
+    // both. The direction is taken before the clamp, so the light still
+    // points from where it was put.
+    float scaled = max(dist, distanceScale*0.25)/max(distanceScale, 0.0001);
+    float atten = lightIntensity/(1.0 + falloff*scaled*scaled);
+
+    // With a flat normal, dot(N, L) reduces to (P.z - lightPos.z)/dist, so it
+    // passes through exactly zero at the light's depth plane and max(dot, 0)
+    // clamps hard there. Any surface sitting near that plane then flickers on
+    // and off with the model's depth noise, which is what speckled the room.
+    //
+    // The room therefore uses a wrapped term that never reaches zero and has
+    // no terminator to straddle. It gives up the fact that a light behind a
+    // wall should not light it - a distinction resting on the least reliable
+    // part of the depth - and keeps distance falloff doing the work of placing
+    // the light.
+    //
+    // The subject used to keep true Lambert, on the grounds that its normals
+    // are real. They are not, on a live feed: the measured tilt is scaled
+    // down almost to nothing there, so the same hard terminator ran through
+    // the face wherever its depth crossed the light's, and the depth noise
+    // drew it as dark blotches that moved. The subject now gets a terminator
+    // with a soft edge instead: light reaches a little past 90 degrees and
+    // fades out, so depth noise shifts the brightness slightly instead of
+    // switching it.
+    float ndl = dot(normal, L);
+    float soft = clamp((ndl + terminatorWrap)/(1.0 + terminatorWrap), 0.0, 1.0);
+    float diffuse = mix(ndl*0.5 + 0.5, soft, subject)*atten;
+    // Diffuse only in the room: a specular highlight on a flat normal is a
+    // hard bright disc, which reads as a blemish on a wall rather than as a
+    // glint on a surface.
+    float specular = pow(max(dot(normal, H), 0.0), shininess)*specularStrength*atten*subject;
+
+    // Only the depth model can cast shadows; the luminance model has no
+    // geometry to march through. Ambient is deliberately left out of the
+    // shadow term, since a shadowed surface still sees the room.
+    float shadow = 1.0;
+    if (geometryMode == 1)
+    {
+        // And only the subject receives them. A shadow thrown onto the room
+        // lands on a wall whose depth is a guess, from a silhouette whose
+        // thickness is a guess, and it showed: a dark halo around the person
+        // that crawled over the wall, curtains and furniture. In the room the
+        // march is skipped altogether, which also saves its cost there.
+        //
+        // Texels on a depth step are left out as well. Their depth is a blend
+        // of the person and whatever is behind, which puts them behind the
+        // person's own surface, so they shadowed themselves: a dark line down
+        // the side of the head facing away from the light.
+        float receives = ((maskEnabled == 1) ? subject : 1.0)*surfaceTrust;
+        if (receives > 0.004)
+        {
+            // Either marched here, or read from the shadow pass, which did the
+            // same march at low resolution and then blurred it and averaged it
+            // over time (see shadowpass.c).
+            float thrown = (shadowSource == 1) ? texture(shadowTex, fragTexCoord).r
+                                             : shadowFactor(P, L, dist);
+            shadow = mix(1.0, thrown, receives);
+        }
+        diffuse *= shadow;
+        specular *= shadow;
+    }
 
     vec3 color = albedo*(ambient + diffuse*lightColor) + specular*lightColor;
 
-    if (viewMode == 1) color = normal*0.5 + 0.5;
+    // The subject is fully relit; the room is blended toward its lit version
+    // by roomLight, so 0 leaves the frame exactly as the camera saw it and
+    // higher values let the light show in the scene.
+    if ((geometryMode == 1) && (maskEnabled == 1))
+    {
+        color = mix(albedo, color, mix(roomLight, 1.0, subject));
+    }
+
+    // --- the light itself ---------------------------------------------------
+    //
+    // Everything above lights surfaces, and a light with no surface near it
+    // was invisible: off to the side or behind the person there was nothing
+    // to say where it was. So the source is drawn too: a bright disc, a glow
+    // around it, the person in front of it, and the two things a backlight
+    // does to a silhouette - glow spilling over the outline, and a rim of
+    // light along the edge.
+    if ((geometryMode == 1) && (viewMode == 0) && (lightPos.z > 0.0001) &&
+        ((sourceLook.y > 0.0) || (sourceLook.w > 0.0)))
+    {
+        // Where the light is in the picture, and how far this pixel is from
+        // it, in picture heights so the disc is round.
+        vec2 lightUv = projectToUv(lightPos);
+        vec2 q = (fragTexCoord - lightUv)*vec2(aspect, 1.0);
+        float d = length(q);
+
+        // A source of fixed physical size, so pushing the light away makes it
+        // a small sun and pulling it close makes it a large lamp.
+        float tanHalfFovY = tanHalfFovX/aspect;
+        float r = clamp(sourceLook.x*distanceScale/(2.0*tanHalfFovY*lightPos.z), 0.004, 0.3);
+        float core = 1.0 - smoothstep(r*0.6, r, d);
+        // Two glows: a tight one that follows the disc's size, and a wide faint
+        // one whose reach is capped, or a large near source washes out the
+        // whole picture.
+        float tight = r*2.5;
+        float wide = min(r*7.0, 0.3);
+        float glow = 0.4*exp(-d*d/(2.0*tight*tight)) + 0.12*exp(-d*d/(2.0*wide*wide));
+
+        // Is the person in front of the light here? Only the person hides it:
+        // the room's depth is not good enough to say whether a light is in
+        // front of a curtain or behind it, and a source that winked out
+        // against the furniture would be the old problem again. The test is
+        // a ramp around the light's depth, so depth noise fades rather than
+        // flips it.
+        float person = (maskEnabled == 1) ? subject : 1.0;
+        float z = depthAt(fragTexCoord);
+        float band = 0.05*distanceScale;
+        float lightBehind = (z > 0.0) ? smoothstep(-band, band, lightPos.z - z) : 0.0;
+        float hidden = person*lightBehind;
+
+        // How close this pixel is to the person's outline, from the inside,
+        // and which way is out. Sixteen taps of the mask on two rings: their
+        // mean is 1 deep inside and about a half on the outline, and their
+        // weighted sum points inward. The mask is used, not the normals,
+        // because the outline is the steadiest thing we have.
+        float edge = 0.0;
+        float edgeThin = 0.0;
+        vec2 outward = vec2(0.0);
+        if ((maskEnabled == 1) && (subject > 0.02))
+        {
+            // The rings reach much further than the rim is wide: a pixel just
+            // inside the outline has only a few taps outside it, so the mean
+            // falls slowly, and with rings the width of the rim the rim came
+            // out a third as wide as intended and lost in the soft edge.
+            const float rimWidth = 0.03;    // picture heights
+            vec2 w = vec2(rimWidth/aspect, rimWidth);
+            float sum = 0.0;
+            float sumNear = 0.0;
+            vec2 inward = vec2(0.0);
+            for (int i = 0; i < 8; i++)
+            {
+                float a = float(i)*0.7853982;
+                vec2 dir = vec2(cos(a), sin(a));
+                float far = texture(subjectMask, fragTexCoord + dir*w).r;
+                float near = texture(subjectMask, fragTexCoord + dir*w*0.3).r;
+                sum += far + near;
+                sumNear += near;
+                inward += dir*(far + near);
+            }
+            // Two widths from the same taps. The wide one is for the glow
+            // spilling over the outline, which is soft. The thin one, from the
+            // inner ring alone, is for the rim: a rim as wide as the spill was
+            // a grey band around the person, and it is a line of light.
+            edge = subject*smoothstep(0.0, 0.35, 1.0 - sum/16.0);
+            edgeThin = subject*smoothstep(0.0, 0.4, 1.0 - sumNear/8.0);
+            outward = -inward;
+        }
+
+        float power = clamp(lightIntensity*0.5, 0.0, 1.5);
+
+        // The disc is hidden behind the person; the glow is hidden too,
+        // except along the outline, where it spills over.
+        float coreSeen = core*(1.0 - hidden);
+        float glowSeen = glow*(1.0 - hidden*(1.0 - sourceLook.z*edge));
+        color += (mix(lightColor, vec3(1.0), 0.5)*coreSeen*2.0 + lightColor*glowSeen)*sourceLook.y*power;
+
+        // The rim: the outline lit from behind. It is added after the shadow
+        // term, so a shadow cannot eat it.
+        //
+        // What decides its strength is how near the outline is to the light
+        // in the picture, not which way the outline faces. A light straight
+        // behind the head has every part of the outline facing away from it
+        // in the picture, and that is exactly when the rim should run all the
+        // way round; so facing the light only adds to it. Nearness falls off
+        // fast, or the rim becomes an even grey line around the whole person
+        // and the chair, which reads as a cut-out, not as light.
+        float toward = 0.0;
+        if ((dot(outward, outward) > 1.0e-6) && (d > 1.0e-4))
+            toward = max(dot(normalize(outward), -q/d), 0.0);
+        float nearness = 1.0/(1.0 + (d/0.22)*(d/0.22));
+        float rim = sourceLook.w*edgeThin*lightBehind*(0.55 + 0.45*toward)*nearness*power;
+        color += (albedo*2.0 + 0.4)*lightColor*rim*2.0;
+    }
+
+    if (viewMode == 4)
+    {
+        float subject = texture(subjectMask, fragTexCoord).r;
+        color = mix(albedo*0.25, vec3(0.2, 1.0, 0.3), subject*0.75);
+    }
+    // Diagnostic only, not offered in the app: the raw shadow term, so the clip
+    // analysis can measure where shadows fall separately from the lighting.
+    else if (viewMode == 5) color = vec3(shadow);
+    else if (viewMode == 1) color = normal*0.5 + 0.5;
     else if (viewMode == 2) color = albedo;
+    else if (viewMode == 3)
+    {
+        // Near is white, far is black, no data is red so it cannot be
+        // mistaken for geometry.
+        float z = depthAt(fragTexCoord);
+        if (z <= 0.0) color = vec3(0.6, 0.0, 0.0);
+        else
+        {
+            float t = (z - depthRange.x)/max(depthRange.y - depthRange.x, 0.0001);
+            color = vec3(1.0 - clamp(t, 0.0, 1.0));
+        }
+    }
 
     finalColor = vec4(color, 1.0);
 }

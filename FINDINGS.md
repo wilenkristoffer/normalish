@@ -137,6 +137,211 @@ most-derived interface makes QI for its bases fail with `E_NOINTERFACE`. Use
 `ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>`
 and likewise for streams.
 
+## ONNX Runtime
+
+- **The DirectML provider needs `DirectML.dll` shipped alongside
+  `onnxruntime.dll`.** The `Microsoft.ML.OnnxRuntime.DirectML` NuGet package
+  does not contain it; it declares a dependency on `Microsoft.AI.DirectML`
+  instead. Windows does ship a `DirectML.dll` in System32, but not
+  necessarily the version ONNX Runtime was built against.
+- **NuGet packages are plain zips**, fetchable by URL from
+  `nuget.org/api/v2/package/<id>/<version>`, so CMake FetchContent can pull
+  them without nuget.exe - which is not installed here.
+- The C API needs only `onnxruntime.lib` to link; the DirectML provider is
+  selected with `OrtSessionOptionsAppendExecutionProvider_DML` from
+  `dml_provider_factory.h`.
+- **The DirectML provider requires `DisableMemPattern` and
+  `ORT_SEQUENTIAL` execution mode**, both set on the session options before
+  the session is created.
+- `CreateSession` takes `ORTCHAR_T*`, which is `wchar_t*` on Windows.
+- Read input and output names off the model with `SessionGetInputName` and
+  `SessionGetOutputName` rather than hardcoding them.
+- **The first inference costs roughly double**, paying for shader
+  compilation and allocation. Time a warm-up run separately or the numbers
+  are wrong.
+
+## Depth maps
+
+- **Normals from a monocular depth model are dominated by the model's own
+  error.** At 2.5 m a 518-wide depth map spans roughly 7 mm of scene per
+  texel, so a 5 mm depth error between neighbours tilts a normal by 36
+  degrees. These models are trained for depth accuracy, not gradient
+  accuracy, and their surfaces undulate by centimetres. Attenuating the tilt
+  (scale the normal's lateral components, renormalise) is what works.
+- **Widening the gradient taps makes that worse, not better**, because the
+  error is low-frequency: it converts fine noise into large blobs.
+- **Take the gradient at the depth map's own texel size**, not the colour
+  image's. Sampling inside a single depth texel reads the bilinear
+  interpolation, and the normals then follow the interpolation grid.
+- **Nothing may assume a scene's scale.** A synthetic subject at 0.6 m and a
+  real room running to 8 m break every hardcoded range - light distance,
+  shadow thickness, shadow bias, march span, view mapping, slider bounds.
+  Derive them from the depth source's own reported range, and measure falloff
+  relative to the nearest surface so one setting travels between scenes.
+- **Segmenting a person out of a depth map needs continuity plus an absolute
+  band, and the band must be per region.** Continuity alone connects a person
+  through their chair and the floor to the far wall. One global band anchored
+  on the frame's nearest pixel fails whenever something else is nearer than
+  the subject.
+- **A single seed is not a person detector.** Label candidate regions and
+  score them; the test that does the most work is penalising a region that
+  covers most of the frame height at one side, which is what a curtain, wall
+  or door frame looks like.
+- **Nor is region scoring a person detector.** With nobody in frame, the
+  office chair in the subject position is what gets selected: its headrest and
+  back read as a head and shoulders in depth, and it is near, central, large
+  and running out of the bottom of frame - every feature the scoring rewards.
+  Separating a chair from a person needs an actual person or face model.
+- **A "metric" monocular model's absolute scale can simply be wrong, by a
+  lot.** Measured here: a subject sitting under 1 m from the webcam was
+  reported at 3.10 m, with the scene's near plane at 2.46 m - out by roughly
+  3x. The likely reason is the training distribution:
+  Depth-Anything-V2-Metric-Hypersim is trained on synthetic *room-scale
+  architecture*, and a head filling the frame at 70 cm is nothing like that,
+  so it reads the scene as a larger room viewed from further back. Never
+  present these numbers to a user as real distances.
+- **A "metric" monocular model's absolute depth is not trustworthy.**
+  Measured on two frames of the same room: five static points (wall, curtain,
+  doorway) read 0.19 to 0.32 m nearer in one frame than the other, so the
+  global scale drifts between inferences. Worse, at one pixel a chair back
+  read 0.68 m *nearer* than the chest of the person who had been sitting in
+  front of it - the sign is wrong, not just the magnitude. Use these depths
+  for relative structure, and derive every parameter from the scene's own
+  reported range; do not compare absolute values across frames, and do not
+  build a decision on one.
+- **A live camera is not a test fixture when the scene can change.** Three
+  conclusions here were drawn from before-and-after screenshots of a room
+  with other people moving in it, and each compared two different scenes: an
+  empty chair that had supposedly moved, a speckle artefact that appeared to
+  survive a fix, and a mask that seemed to cover the wrong thing. Grab one
+  frame and render *that* repeatedly instead.
+- **With a flat normal, `dot(N, L)` is proportional to `P.z - lightPos.z`**,
+  so it crosses zero exactly at the light's depth plane and `max(dot, 0)`
+  clamps hard there. Any surface lying near that plane flickers on and off
+  with depth noise. A wrapped term that never reaches zero removes the
+  terminator; the falloff still places the light.
+- **Clamp the minimum distance in a point light's falloff.** The derivative
+  of `1/(1 + f d^2)` is largest as d approaches zero, which is exactly where
+  depth noise becomes speckle and where putting the light on a surface blows
+  it out.
+- **Do not explain a surprising number until you have measured why.** Two
+  confident explanations were offered for a chair outscoring a person - that
+  empty chairs are nearer than their occupants, and that the chair had been
+  moved - and both were wrong, the first physically backwards and the second
+  contradicted by the user. Probing identical pixels in both frames took a
+  few minutes and gave the actual answer, which was about the model rather
+  than the scene.
+- **A monocular model's input size caps the depth resolution, so a higher
+  capture resolution does not improve depth.** Measured from 1080p to 4K: the
+  depth map stays 518 wide, the mask changes by 0.1% of frame, and the depth
+  gradient is 4% smoother. Worth doing only for output sharpness.
+- **Depth alone cannot say which thing is the person.** Scoring depth-band
+  regions picked the curtain or a box for 1 to 4 frames at a time on a person
+  sitting still (17 of 194 frames), and picked the chair in an empty room.
+  Every flip flashed the face by about 46 levels. Earlier notes here treated
+  this as tunable; it is not. Depth answers "how far", a segmentation model
+  answers "who".
+- **Depth trailing the picture by a frame is not what makes shadows jump.**
+  Replaying a waving clip with the depth one frame late measured the same as
+  with none. The causes were the mask flipping and the march itself.
+- **Measure the live rate live.** A recorder writing 1080p frames to disk
+  logged 21-24 fps and that was reported as the camera's rate. The camera
+  delivers 39 new frames a second; the disk was the limit. Likewise the 44 ms
+  inference recorded earlier was with the GPU shared; alone it is 23 ms.
+- **The flat-normal terminator applies to the person too, not only the
+  room.** An earlier entry fixed it for the room and left the person on a
+  hard clamp because "its normals are real". On the live feed the relief is
+  scaled to 0.02, so they are nearly flat, and the clamp drew moving dark
+  blotches on the face wherever its depth crossed the light's. Most of what
+  looked like bad shadows was this. A terminator with a soft edge
+  (`(ndl + w)/(1 + w)`, w = 0.35) turns the switch into a small change.
+- **Test with the light where a person would put it.** The analysis default
+  put the light inside the head, the worst case for the entry above, and two
+  stages of numbers were taken there.
+- **A depth map has no back faces, so flip any normal that points away.** On
+  a surface seen nearly edge-on the neighbouring point lands on the wrong
+  side and the cross product changes sign. Those texels were lit from
+  behind: black lines and speckle.
+- **A depth step is a ramp, and a ramp is not a surface.** The 518-wide map
+  stretched over 1080p smears every step over a few texels. Picking the
+  better of the two one-sided differences does not help a texel in the
+  middle of the ramp; both sides are steep. Believe a difference less as its
+  slope passes 4 and not at all past 12, and give those texels no shadow.
+- **Thresholds on noisy depth flip; ramps do not.** The march's "behind the
+  surface" and "inside the slab" tests are smoothsteps now.
+- **March shadows once, small, then blur and average over time.** At 640
+  wide the march is already finer than the depth map, and a 0.10 s average
+  on the shadow term alone does not smear the picture.
+- **Two render-texture passes cancel raylib's vertical flip.** The raw march
+  is drawn flipped, the filter pass flips it back, so the history is upright
+  in the picture's own coordinates and is read with `gl_FragCoord`.
+- **`cast` is a reserved word in GLSL.** A variable of that name fails to
+  compile, and since shaders are loaded at run time from the source folder
+  the build still succeeds. Check the log for `SHADER` errors after a shader
+  edit.
+- **A light that only lights surfaces is invisible in empty space.** Draw
+  the source itself. Let only the person hide it: the room's depth is not
+  good enough to put a light in front of or behind the furniture.
+- **Build the rim from the mask's outline, not from the normals.** The
+  outline is the steadiest thing there is; sitting still the rim adds
+  nothing measurable to the flicker.
+- **A ring of mask taps gives an edge band much narrower than its radius.**
+  Just inside the outline only a few taps fall outside, so the mean barely
+  moves. Taps 13 px out gave a 10 px band lost in the mask's soft fringe.
+- **Rim strength follows nearness to the light in the picture, not which way
+  the outline faces.** With the light straight behind the head the whole
+  outline faces away from it, and that is when the rim should go all the
+  way round. An even rim everywhere reads as a cut-out, not as light.
+- **Spill is wide and soft, the rim is thin.** One band for both gave a grey
+  halo. Two rings of the same taps give both widths.
+- **Cap the wide glow's reach.** Scaled with a near light's disc it washed
+  out the whole picture.
+
+## Person segmentation
+
+- **MediaPipe's selfie models run fine under ONNX Runtime** from community
+  conversions, all Apache 2.0: landscape (256x144, 462 kB, 2 ms on two CPU
+  threads, no faster on the GPU), square (256x256, 462 kB, 4 ms CPU) and
+  multiclass (256x256, 16.5 MB, 3.5 ms on DirectML, 67 ms on the CPU). Input
+  is RGB scaled to 0..1 with no mean or deviation.
+- **Read the layout off the model.** The same network is published NCHW by
+  one converter and NHWC by another, and the multiclass output is six class
+  scores (background, hair, body skin, face skin, clothes, others), not one
+  person channel. Person = 1 - softmax(background).
+- **Each model fails differently, and none is enough alone.** Landscape is
+  solid on a torso in any clothing but drops a hand raised away from the
+  body and marks bright windows and half of an empty chair. Multiclass is
+  sure about heads and hands and never took furniture for a person, but
+  barely marks a dark top against a dark chair. Union of both, kept only
+  where connected to pixels multiclass is sure of and not far behind them in
+  depth, held up on five of six clips.
+- **Squash, do not letterbox, a 16:9 frame into the square multiclass
+  model.** Letterboxing recovered a little of the shoulders but produced a
+  large false region on a bed behind a waving hand.
+- **A person with no face in view is not found.** Back turned in dark
+  clothes at the frame edge, or bent close to the lens: both models give
+  little or nothing. The mask going empty is the graceful outcome.
+- **An empty-room difference image is a poor reference for "where the person
+  is"** when clothes and furniture are equally dark, and wrong once the
+  person has moved the furniture. Trust its trends, not its absolutes, and
+  look at the frames.
+- **Run the segmentation models before taking the lock, and feed them the
+  picture the depth network already has.** The worker undoes the ImageNet
+  normalisation on the 518x291 crop instead of keeping a second copy of the
+  camera frame, so mask and depth come from exactly the same frame. Only the
+  cheap combining step runs under the lock the render thread waits on.
+- **Gate the mask with this frame's raw depth, not the smoothed depth.** The
+  smoothed map trails a moving arm, and the "not far behind the person" test
+  then cuts the arm off.
+- **A fixed temporal average is wrong for a mask.** It trails a moving arm
+  with a ghost. No average lets a one-pixel wobble at the silhouette crawl.
+  Scale the blend by the size of the change: small changes are averaged
+  (0.3), a pixel that flips completely follows at once. Remaining flaw: the
+  soft rim of a region that vanishes fades over about five results, a faint
+  outline in the mask view that was not visible in the lit picture.
+- **Hold the last mask for two results when nobody is found.** A single
+  missed frame otherwise blinks the whole relight off.
+
 ## Build
 
 - **`UNICODE`/`_UNICODE` must be defined** for code written against a Visual
