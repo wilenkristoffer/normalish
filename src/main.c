@@ -5,6 +5,7 @@
 #include "depthmodel.h"
 #include "personmask.h"
 #include "record.h"
+#include "clip.h"
 #include "relightshader.h"
 #include "analyse.h"
 #include "shadowpass.h"
@@ -666,6 +667,39 @@ int main(int argc, char **argv)
         int presets = (int)(sizeof(captureWidths)/sizeof(captureWidths[0]));
         if ((mode < 0) || (mode >= presets)) mode = 2;
         int result = RunRecordSession(argv[2], captureWidths[mode], captureHeights[mode]);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return result;
+    }
+
+    if ((argc > 3) && TextIsEqual(argv[1], "--clip-from-image"))
+    {
+        // --clip-from-image <image> <out clip> [frames]
+        // A still picture repeated as a clip, so a photo can go through the
+        // same replay as a recording. Used for the README's pictures, which
+        // must not be footage of a real room.
+        int frames = (argc > 4) ? atoi(argv[4]) : 40;
+        Image image = LoadImage(argv[2]);
+        int result = 1;
+        if ((image.data != NULL) && (frames > 0))
+        {
+            ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+            size_t frameBytes = (size_t)image.width*image.height*3;
+            unsigned char *rgb = malloc(frameBytes*frames);
+            double *seconds = malloc(sizeof(double)*frames);
+            if ((rgb != NULL) && (seconds != NULL))
+            {
+                for (int f = 0; f < frames; f++)
+                {
+                    memcpy(rgb + frameBytes*f, image.data, frameBytes);
+                    seconds[f] = f/30.0;
+                }
+                if (SaveClip(argv[3], image.width, image.height, frames, seconds, rgb)) result = 0;
+            }
+            free(rgb);
+            free(seconds);
+        }
+        if (image.data != NULL) UnloadImage(image);
         UnloadShader(rs.shader);
         CloseWindow();
         return result;

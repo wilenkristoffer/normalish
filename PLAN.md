@@ -1270,6 +1270,36 @@ backlit person is nearly black unless Ambient is raised; the light shows
 through the half-masked waving hand; with nobody found there is no spill
 or rim.
 
+**Stage 5 - write-up (done 2026-11-10).** README: the depth section
+described the old depth-band subject selector and is rewritten for the two
+segmentation models, with a Backlight subsection, its limits and one
+picture. The picture is the bundled stock portrait, not footage of the
+user, who asked for that. The app only lights the photo in luminance mode,
+so `--clip-from-image` turns a picture into a clip and `--analyse-clip`
+replays it down the live path; the middle panel is that replay with the
+drawn light switched off (`nosource`), not the code as it was before the
+branch. `tools/get-person-models.ps1` is new: until now a fresh clone had no
+way to fetch the two person models and would have fallen back to the
+depth-band guess without saying why it looked worse.
+
+Verdict on merging. Against the three complaints the branch started from:
+
+- "Can't see the light": fixed. Judged live as always visible, blocked
+  well enough by the head, steady.
+- "Shadows land everywhere": fixed. Under 0.35% of room pixels shadowed in
+  the worst frame of any run, from 5 to 55% on average.
+- "Shadows on the person look bad": much better, not finished. "96% good"
+  live; rough with movement and with the light inside the head.
+
+Frame time is where it started or better (16.7 ms at both sizes, from 16.87
+and 17.39); depth results fell from about 25 to about 22 a second, the cost
+of the two person models. It is fit to merge as an experimental mode, which
+is how the README labels it. It is not a finished effect: the waving hand,
+loose hair and a person with their back turned are all visibly wrong, and
+all three are the mask's limits, not the lighting's. Everything was tuned
+and judged in one room, on one camera, with one person, which is the
+biggest unknown.
+
 #### Expectation to set now
 
 Everything in phases A to C was judged against perfect synthetic depth with

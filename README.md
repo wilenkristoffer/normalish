@@ -73,6 +73,8 @@ normalish/
   src/vcam/        Media Foundation media source DLL (C++)
   shaders/         GLSL fragment shaders
   assets/          input photos
+  docs/            pictures for this README
+  tools/           scripts that fetch the models and record test clips
   build/           generated - build output and fetched raylib (not tracked)
 ```
 
@@ -82,6 +84,10 @@ All five planned phases complete. A movable point light relights either a
 still photo or the live webcam feed in real time, at 60 FPS, with a control
 panel for tuning the look. See [PLAN.md](PLAN.md) for the phase-by-phase
 record, including where the plan turned out to be wrong.
+
+Since then, experimentally: the live feed can be lit in real depth, from
+behind as well, with the light itself visible. See
+[Depth geometry](#depth-geometry-experimental).
 
 ## Webcam
 
@@ -171,7 +177,7 @@ because lens reflections read as raised blobs.
 ## Depth geometry (experimental)
 
 The **Geometry** switch chooses how the surface is derived. *Luminance* is the
-original model and what the photo and webcam sources use: the image is a flat
+original model and the only one for the photo: the image is a flat
 plane, brightness stands in for height, and the viewer is orthographic.
 *Depth* treats the image as a real perspective surface, with normals taken
 from an actual depth map and the light positioned in metres in camera space.
@@ -180,8 +186,9 @@ In depth mode the height slider becomes a **distance** slider - how far the
 light is from the camera - so pushing it past the subject is what puts the
 light behind them. It reads in metres for the test scenes, where the distance
 is genuinely known, and in relative units (`u`) for the depth model, whose
-absolute scale measured about 3x out here. That produces a silhouette with a rim along the lit edge,
-and, with shadows on, a shadow cast onto the wall behind.
+absolute scale measured about 3x out here. On the test scenes that produces
+a silhouette with a rim along the lit edge and a shadow cast onto the wall
+behind; on the live feed see Backlight below.
 
 The live webcam feed gets its depth from a monocular depth model
 (Depth-Anything-V2-Metric-Hypersim-Small, Apache-2.0) run through ONNX
@@ -194,19 +201,54 @@ The model is about 99 MB and is not in this repository - fetch it once with
 `powershell -File tools/get-depth-model.ps1`, and until then depth mode says
 why it is unavailable.
 
-**Subject only** is on by default: the light is applied to you and the room
-behind you is left as the camera saw it. Relighting the whole frame means
-relighting curtains and furniture, where the depth model is least reliable
-and the artefacts are worst. The subject is found by labelling
-depth-continuous regions within a depth band and scoring them on being near,
-central, a fair share of the frame and running out of the bottom of it;
-**Subject depth** sets the band and **Spill** lets some light past the edge.
+**Subject only** is on by default: the light is applied to you, and the room
+behind you is blended toward its lit version by **Room light** (0 leaves it
+exactly as the camera saw it). Relighting the whole frame means relighting
+curtains and furniture, where the depth model is least reliable and the
+artefacts are worst. Shadows fall on the person only, for the same reason.
 
-This is a nearest-central-object selector rather than a person detector. With
-nobody in frame it selects the office chair, whose headrest and back read as a
-head and shoulders in depth; telling a chair from a person would need a second
-model. Step away and the light stays on your chair, which is close enough to
-where it belongs.
+The person is found by two MediaPipe selfie segmentation models (Apache-2.0),
+combined with the depth map: one is good at torso and shoulders, the other
+at head, hair and hands, and neither is enough alone. They are 0.5 MB and
+16.5 MB, cost about 6 ms per depth result on the depth thread, and are
+fetched once with `powershell -File tools/get-person-models.ps1`. Without
+them the subject is guessed from the depth map alone (nearest central
+region, with a **Subject depth** slider), which is not a person detector:
+with nobody in frame it lights the office chair.
+
+### Backlight
+
+![The bundled portrait: as shot, relit from behind, and relit from behind with the light drawn](docs/backlight.png)
+
+*Left: the bundled photo. Middle: lit from behind and to the left, as the
+shader did it before the light itself was drawn - the wall brightens, and
+nothing says where the light is. Right: the same light drawn, with the head
+in front of it, glow spilling over the outline and a rim along the hair.
+Rendered by replaying the photo as a clip (`--clip-from-image`, then
+`--analyse-clip`), which is the same path the live feed takes.*
+
+Push **Distance** past yourself and the light goes behind you. The light is
+drawn as a disc with a glow (**Source glow**, **Source size**), the person
+hides it, the glow spills over their outline (**Spill**) and the outline
+nearest the light gets a rim (**Rim light**). Only the person hides the
+light; the room never does, because the model's depth for a curtain or a
+wall is not good enough to say which side of it a light is on.
+
+What it does not do well, measured on recorded clips and judged live:
+
+- A backlit person is close to black, as they would be. Raise **Ambient**.
+- Loose hair outside the mask is neither hidden behind nor rimmed.
+- A fast-moving hand is only partly found, so the light shows through it
+  and it is lit unevenly.
+- Someone with their back turned at the edge of the frame is not found and
+  is left unlit.
+- The shadows on the person are steady when sitting still and get rougher
+  with movement; with the light placed inside the head, the top of the head
+  goes dark.
+
+It holds 60 FPS at 720p and 1080p on an RX 7800 XT (16.7 ms a frame), with
+depth arriving about 22 times a second. [PLAN.md](PLAN.md) has the numbers
+stage by stage, including the conclusions that turned out to be wrong.
 
 Capture resolution does not affect depth quality - the model's input is a
 fixed 518 square - so 1080p is the sensible choice. 1440p and 4K are offered
@@ -226,8 +268,9 @@ happens to be pointing at.
 
 A depth map is 2.5D - one depth per pixel, from the camera's viewpoint - so
 a light behind the subject cannot illuminate the back of their head, because
-no camera ever saw it. See [PLAN.md](PLAN.md) for the candidate depth sources
-and why the choice is still open.
+no camera ever saw it. The rim and the spill are drawn from the person's
+outline instead. See [PLAN.md](PLAN.md) for the candidate depth sources that
+were weighed.
 
 ## Virtual camera
 
