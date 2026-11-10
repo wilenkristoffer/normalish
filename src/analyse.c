@@ -20,6 +20,7 @@
 #include "clip.h"
 #include "depthmodel.h"
 #include "personmask.h"
+#include "shadowpass.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -130,8 +131,12 @@ static void MinMaxFilter(unsigned char *image, unsigned char *scratch, int w, in
 }
 
 static void RenderView(const RelightShader *rs, RenderTexture2D target, Texture2D albedo,
-                       Texture2D depth, Texture2D mask, int view, int steps)
+                       Texture2D depth, Texture2D mask, Texture2D shadow, int view, int steps)
 {
+    // A valid shadow texture means "read the shadow pass"; none means march
+    // in the shader, which with zero steps is how shadows are left out.
+    int shadowSource = ((shadow.id != 0) && (steps > 0)) ? 1 : 0;
+    SetShaderValue(rs->shader, rs->shadowSourceLoc, &shadowSource, SHADER_UNIFORM_INT);
     SetShaderValue(rs->shader, rs->viewModeLoc, &view, SHADER_UNIFORM_INT);
     SetShaderValue(rs->shader, rs->shadowStepsLoc, &steps, SHADER_UNIFORM_INT);
 
@@ -142,6 +147,7 @@ static void RenderView(const RelightShader *rs, RenderTexture2D target, Texture2
     BeginShaderMode(rs->shader);
     SetShaderValueTexture(rs->shader, rs->depthMapLoc, depth);
     SetShaderValueTexture(rs->shader, rs->subjectMaskLoc, mask);
+    if (shadowSource == 1) SetShaderValueTexture(rs->shader, rs->shadowTexLoc, shadow);
     DrawTexturePro(albedo, source, dest, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
     EndShaderMode();
     EndTextureMode();
@@ -270,6 +276,7 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
     Texture2D depthTex = { 0 }, maskTex = { 0 };
     RenderTexture2D target = LoadRenderTexture(aw, ah);
     RenderTexture2D fullTarget = LoadRenderTexture(w, h);
+    ShadowPass shadowPass = LoadShadowPass(w, h);
 
     float *prevDepth = NULL;
     unsigned char *prevMask = NULL;
@@ -302,6 +309,7 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
     SetShaderValue(rs->shader, rs->depthReliefLoc, &relief, SHADER_UNIFORM_FLOAT);
     SetShaderValue(rs->shader, rs->maskEnabledLoc, &maskOn, SHADER_UNIFORM_INT);
     SetShaderValue(rs->shader, rs->roomLightLoc, &roomLight, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(rs->shader, rs->terminatorWrapLoc, &options.wrap, SHADER_UNIFORM_FLOAT);
 
     int dumpAt[6] = { frames/6, frames/2, frames/2 + 1, frames*5/6,
                       options.extraDump[0], options.extraDump[1] };
@@ -373,12 +381,21 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
         SetShaderValue(rs->shader, rs->shadowBiasLoc, &bias, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs->shader, rs->shadowThicknessLoc, &thickness, SHADER_UNIFORM_FLOAT);
 
+        // The shadow pass, fed the clip's own frame times so its average over
+        // time reaches back as far as it would live.
+        int marchSteps = 24;
+        SetShaderValue(rs->shader, rs->shadowStepsLoc, &marchSteps, SHADER_UNIFORM_INT);
+        float elapsed = (f > 0) ? (float)(times[f] - times[f - 1]) : 0.0f;
+        Texture2D shadowTex = { 0 };
+        if (options.filteredShadows)
+            shadowTex = UpdateShadowPass(&shadowPass, rs, albedoTex, depthTex, maskTex, elapsed);
+
         // --- the three measured renders ---
-        RenderView(rs, target, albedoTex, depthTex, maskTex, 0, 24);
+        RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 0, 24);
         ReadLuma(target, yOut);
-        RenderView(rs, target, albedoTex, depthTex, maskTex, 0, 0);
+        RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 0, 0);
         ReadLuma(target, yNoShadow);
-        RenderView(rs, target, albedoTex, depthTex, maskTex, 5, 24);
+        RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 5, 24);
         ReadLuma(target, shade);
 
         Downsample(rgba, w, h, small, aw, ah);
@@ -592,15 +609,15 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
         for (int k = 0; k < 6; k++) if (dumpAt[k] == f) dump = true;
         if (dump)
         {
-            RenderView(rs, fullTarget, albedoTex, depthTex, maskTex, 0, 24);
+            RenderView(rs, fullTarget, albedoTex, depthTex, maskTex, shadowTex, 0, 24);
             ExportTarget(fullTarget, TextFormat("%s-f%03d-lit.png", outPrefix, f));
-            RenderView(rs, target, albedoTex, depthTex, maskTex, 4, 24);
+            RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 4, 24);
             ExportTarget(target, TextFormat("%s-f%03d-mask.png", outPrefix, f));
-            RenderView(rs, target, albedoTex, depthTex, maskTex, 5, 24);
+            RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 5, 24);
             ExportTarget(target, TextFormat("%s-f%03d-shadow.png", outPrefix, f));
-            RenderView(rs, target, albedoTex, depthTex, maskTex, 1, 24);
+            RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 1, 24);
             ExportTarget(target, TextFormat("%s-f%03d-normal.png", outPrefix, f));
-            RenderView(rs, target, albedoTex, depthTex, maskTex, 3, 24);
+            RenderView(rs, target, albedoTex, depthTex, maskTex, shadowTex, 3, 24);
             ExportTarget(target, TextFormat("%s-f%03d-depth.png", outPrefix, f));
 
             for (size_t i = 0; i < an; i++) work[i] = (unsigned char)(region[i]*127);
@@ -672,6 +689,7 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
 
     UnloadRenderTexture(target);
     UnloadRenderTexture(fullTarget);
+    UnloadShadowPass(&shadowPass);
     UnloadTexture(albedoTex);
     if (depthTex.id != 0) UnloadTexture(depthTex);
     if (maskTex.id != 0) UnloadTexture(maskTex);

@@ -54,6 +54,9 @@ uniform float distanceScale;
 uniform int shadowSteps;        // 0 disables the shadow march
 uniform float shadowBias;       // metres; below this a surface shadows itself
 uniform float shadowThickness;  // metres an occluder is assumed to extend back
+uniform int shadowSource;       // 0 = march here, 1 = read shadowTex
+uniform sampler2D shadowTex;    // R: 1 lit, 0 shadowed, from the shadow pass
+uniform float terminatorWrap;   // how far past 90 degrees light reaches the subject
 
 uniform vec3 lightPos;   // luminance mode: x in 0..aspect, y in 0..1, z above
                          // surface. depth mode: metres in camera space.
@@ -143,6 +146,10 @@ vec3 depthPosition(vec2 uv)
     return vec3(ndc.x*tanHalfFovX*z, ndc.y*(tanHalfFovX/aspect)*z, z);
 }
 
+// Set by normalFromDepth: 1 where the depth around the texel looks like a
+// surface, falling to 0 where it is the smeared ramp of a depth step.
+float surfaceTrust = 1.0;
+
 // One axis of the surface gradient, as the better of the two one-sided
 // differences. Across a silhouette the far neighbour is metres away and would
 // dominate a central difference, tilting the normal into nonsense; taking
@@ -157,8 +164,23 @@ vec3 axisDelta(vec2 uv, vec3 P, float z, vec2 step)
     float df = (zf > 0.0) ? abs(zf - z) : 1.0e9;
     if ((db > 1.0e8) && (df > 1.0e8)) return vec3(0.0);
 
-    return (df <= db) ? (depthPosition(uv + step) - P)
-                      : (P - depthPosition(uv - step));
+    vec3 delta = (df <= db) ? (depthPosition(uv + step) - P)
+                            : (P - depthPosition(uv - step));
+
+    // Even the better side can be on a depth step. The depth map is small and
+    // stretched over the picture, so a step (head to wall, neck to collar) is
+    // smeared into a ramp a few texels wide, and a texel on the ramp has a
+    // steep difference on both sides. That is not a surface: nothing the
+    // camera can see is tilted more than about 80 degrees away from it. So the
+    // steeper the difference, the less of it is believed, and past a slope of
+    // 12 the texel is called flat along this axis. Without this the ramp
+    // texels got normals lying on their side, which faced away from any light
+    // in front and drew a black line along every depth step.
+    float slope = abs(delta.z)/max(length(delta.xy), 1.0e-6);
+    float believed = 1.0 - smoothstep(4.0, 12.0, slope);
+    delta.z *= believed;
+    surfaceTrust = min(surfaceTrust, believed);
+    return delta;
 }
 
 vec3 normalFromDepth(vec2 uv)
@@ -176,6 +198,15 @@ vec3 normalFromDepth(vec2 uv)
     float len = length(n);
     if (len <= 1.0e-12) return vec3(0.0, 0.0, -1.0);
     n /= len;
+
+    // A depth map only ever shows surfaces from the front. A normal pointing
+    // away from the camera is therefore always an error: it comes out of a
+    // surface seen nearly edge-on (a desk, the step from neck to collar),
+    // where depth falls so fast along the axis that the neighbouring point
+    // lands on the wrong side of this one and the cross product changes sign.
+    // Left alone those texels were lit from behind - thin black lines along
+    // every depth step inside the person, and speckle on edge-on surfaces.
+    if (n.z > 0.0) n = -n;
 
     // Scaling the lateral components and renormalising rotates the normal
     // toward the view axis without changing its direction in the image plane,
@@ -250,10 +281,16 @@ float shadowFactor(vec3 P, vec3 L, float lightDist)
         float sceneZ = depthAt(uv);
         if (sceneZ <= 0.0) continue;    // no data is not an occluder
         // Nor is anything outside the subject.
-        if ((maskEnabled == 1) && (texture(subjectMask, uv).r < 0.5)) continue;
+        float caster = (maskEnabled == 1) ? smoothstep(0.3, 0.7, texture(subjectMask, uv).r) : 1.0;
 
+        // How far the sample is behind the surface it projects onto. The two
+        // limits are ramps, not thresholds: the depth is noisy, and a sample
+        // sitting at a threshold flips between lit and shadowed from frame to
+        // frame, which is what made shadow edges jump.
         float penetration = S.z - sceneZ;
-        if ((penetration > shadowBias) && (penetration < shadowThickness)) occluded += 1.0;
+        float behind = smoothstep(shadowBias, shadowBias*4.0, penetration);
+        float within = 1.0 - smoothstep(shadowThickness*0.6, shadowThickness, penetration);
+        occluded += behind*within*caster;
     }
 
     // A quarter of the ray spent inside geometry is treated as fully
@@ -331,9 +368,19 @@ void main()
     // no terminator to straddle. It gives up the fact that a light behind a
     // wall should not light it - a distinction resting on the least reliable
     // part of the depth - and keeps distance falloff doing the work of placing
-    // the light. The subject keeps true Lambert, where the normals are real.
+    // the light.
+    //
+    // The subject used to keep true Lambert, on the grounds that its normals
+    // are real. They are not, on a live feed: the measured tilt is scaled
+    // down almost to nothing there, so the same hard terminator ran through
+    // the face wherever its depth crossed the light's, and the depth noise
+    // drew it as dark blotches that moved. The subject now gets a terminator
+    // with a soft edge instead: light reaches a little past 90 degrees and
+    // fades out, so depth noise shifts the brightness slightly instead of
+    // switching it.
     float ndl = dot(normal, L);
-    float diffuse = mix(ndl*0.5 + 0.5, max(ndl, 0.0), subject)*atten;
+    float soft = clamp((ndl + terminatorWrap)/(1.0 + terminatorWrap), 0.0, 1.0);
+    float diffuse = mix(ndl*0.5 + 0.5, soft, subject)*atten;
     // Diffuse only in the room: a specular highlight on a flat normal is a
     // hard bright disc, which reads as a blemish on a wall rather than as a
     // glint on a surface.
@@ -350,8 +397,21 @@ void main()
         // thickness is a guess, and it showed: a dark halo around the person
         // that crawled over the wall, curtains and furniture. In the room the
         // march is skipped altogether, which also saves its cost there.
-        float receives = (maskEnabled == 1) ? subject : 1.0;
-        if (receives > 0.004) shadow = mix(1.0, shadowFactor(P, L, dist), receives);
+        //
+        // Texels on a depth step are left out as well. Their depth is a blend
+        // of the person and whatever is behind, which puts them behind the
+        // person's own surface, so they shadowed themselves: a dark line down
+        // the side of the head facing away from the light.
+        float receives = ((maskEnabled == 1) ? subject : 1.0)*surfaceTrust;
+        if (receives > 0.004)
+        {
+            // Either marched here, or read from the shadow pass, which did the
+            // same march at low resolution and then blurred it and averaged it
+            // over time (see shadowpass.c).
+            float thrown = (shadowSource == 1) ? texture(shadowTex, fragTexCoord).r
+                                             : shadowFactor(P, L, dist);
+            shadow = mix(1.0, thrown, receives);
+        }
         diffuse *= shadow;
         specular *= shadow;
     }

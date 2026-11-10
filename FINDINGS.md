@@ -248,6 +248,37 @@ and likewise for streams.
   logged 21-24 fps and that was reported as the camera's rate. The camera
   delivers 39 new frames a second; the disk was the limit. Likewise the 44 ms
   inference recorded earlier was with the GPU shared; alone it is 23 ms.
+- **The flat-normal terminator applies to the person too, not only the
+  room.** An earlier entry fixed it for the room and left the person on a
+  hard clamp because "its normals are real". On the live feed the relief is
+  scaled to 0.02, so they are nearly flat, and the clamp drew moving dark
+  blotches on the face wherever its depth crossed the light's. Most of what
+  looked like bad shadows was this. A terminator with a soft edge
+  (`(ndl + w)/(1 + w)`, w = 0.35) turns the switch into a small change.
+- **Test with the light where a person would put it.** The analysis default
+  put the light inside the head, the worst case for the entry above, and two
+  stages of numbers were taken there.
+- **A depth map has no back faces, so flip any normal that points away.** On
+  a surface seen nearly edge-on the neighbouring point lands on the wrong
+  side and the cross product changes sign. Those texels were lit from
+  behind: black lines and speckle.
+- **A depth step is a ramp, and a ramp is not a surface.** The 518-wide map
+  stretched over 1080p smears every step over a few texels. Picking the
+  better of the two one-sided differences does not help a texel in the
+  middle of the ramp; both sides are steep. Believe a difference less as its
+  slope passes 4 and not at all past 12, and give those texels no shadow.
+- **Thresholds on noisy depth flip; ramps do not.** The march's "behind the
+  surface" and "inside the slab" tests are smoothsteps now.
+- **March shadows once, small, then blur and average over time.** At 640
+  wide the march is already finer than the depth map, and a 0.10 s average
+  on the shadow term alone does not smear the picture.
+- **Two render-texture passes cancel raylib's vertical flip.** The raw march
+  is drawn flipped, the filter pass flips it back, so the history is upright
+  in the picture's own coordinates and is read with `gl_FragCoord`.
+- **`cast` is a reserved word in GLSL.** A variable of that name fails to
+  compile, and since shaders are loaded at run time from the source folder
+  the build still succeeds. Check the log for `SHADER` errors after a shader
+  edit.
 
 ## Person segmentation
 

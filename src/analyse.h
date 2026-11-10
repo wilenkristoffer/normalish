@@ -10,6 +10,8 @@ typedef struct AnalysisOptions {
     float zFactor;          // light distance as a multiple of the scene's near
     int lag;                // frames the depth trails the picture by; 0 = none
     int extraDump[2];       // further frames to write pictures for, -1 = none
+    float wrap;             // terminatorWrap; 0 is the old hard terminator
+    bool filteredShadows;   // false marches in the shader, as before the shadow pass
 } AnalysisOptions;
 
 // Replays a recorded clip through the depth model and the relight shader and

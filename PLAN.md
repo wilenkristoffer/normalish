@@ -1129,6 +1129,82 @@ moving and leaning, going unlit when turned away is acceptable. The
 half-covered waving hand "looks kinda bad" and is carried forward as an
 open problem.
 
+**Stage 3 - better shadows on the person (done 2026-11-10).** Two earlier conclusions were wrong and are corrected here:
+
+- D3 gave the room a wrapped diffuse term and let the person keep a hard
+  terminator "because its normals are real". On the live feed they are not:
+  `depthRelief` is 0.02 there, so the person's normals are almost flat and
+  the diffuse term is in effect `(P.z - light.z)/dist`, clamped at zero. The
+  blotches on the face were mostly not cast shadows at all. They were that
+  clamp, drawn wherever the face's depth crossed the light's depth, moving
+  with the depth noise.
+- The stage 1 and 2 measurements used the analysis's default light (centre
+  of the frame, 1.15x near), which sits inside the head. That is the worst
+  case for the clamp above and not where anyone puts a light. Stage 3 is
+  measured at three positions: front (up and left, in front of the person),
+  behind, and that default.
+
+What changed, all in `lighting.fs` unless noted:
+
+1. Soft terminator on the person (`terminatorWrap`, 0.35 live, 0 where
+   depth is exact so the synthetic scenes are unchanged).
+2. Normals: a normal facing away from the camera is flipped (a depth map has
+   no back faces), and a depth difference steeper than a slope of 4 is
+   believed less and less, down to nothing at 12. Depth steps inside the
+   person (neck to collar, body to chair) are smeared into ramps by the
+   small depth map and were giving normals lying on their side: black lines
+   along every step and speckle on the desk edge.
+3. The march uses ramps instead of thresholds for "behind the surface" and
+   "inside the slab", and a soft caster mask.
+4. Shadows are marched once per frame in their own pass at 640 wide, blurred
+   and averaged over time (0.10 s), and the relight shader reads the result
+   (`shadowpass.c`, `shadowfilter.fs`). Texels on a depth step receive no
+   shadow.
+5. Planned but not needed: fading cast shadows when the light is behind.
+   The diffuse term is already zero there, so the shadow multiplies nothing.
+   Stage 4 must keep the rim and spill out of the shadow term.
+
+Person flicker in the shadow term and in the output picture (mean, with p95
+in brackets), stage 2 code -> stage 3 code, same clips, same lights:
+
+| clip, light | shadow term | output picture |
+|---|---|---|
+| still, front | 0.005 -> 0.001 | 1.18 -> 1.23 |
+| still, behind | 0.34 -> 0.24 | 0.24 -> 0.24 |
+| still, default | 2.79 (5.8) -> 0.19 (0.55) | 1.61 (3.3) -> 1.48 (2.6) |
+| head, front | 0.25 (1.5) -> 0.13 (1.0) | 2.73 -> 2.86 |
+| head, behind | 0.86 (3.0) -> 0.86 (2.8) | 0.47 |
+| head, default | p95 42 -> 16.5 | p95 5.0 -> 6.8 |
+| wave, front | 3.40 (12.0) -> 1.44 (6.1) | 8.64 -> 8.25 |
+| wave, behind | 6.59 (24.1) -> 7.08 (17.7) | 3.57 |
+| wave, default | p95 86 -> 55 | p95 14.8 -> 13.8 |
+
+Lean and leave at the front light: shadow term 0.49 and 0.89, room shadowed
+0.11% and 0.01%. Empty room: nothing. Room shadowed stays under 0.21% in
+every run.
+
+Read honestly: the shadow term is calmer everywhere it was bad, most at the
+default light. The output picture's flicker number hardly moves at the front
+and behind lights, because there the stage 2 picture was already steady and
+what is left is the camera's own noise and the person moving. The visible
+gain at those lights is not in that number: the black lines along the
+collar, shoulders and chair are gone, and so is the speckle on the desk
+edge. At the default light the face is evenly lit where it was blotched.
+Not fixed: with the light inside the head the top of the head still goes
+dark, and the wave is still the roughest clip (the hand is half masked).
+
+Frame time live, after (20 s each): 720p 59.9 fps, 16.70 ms mean, 17.60 ms
+worst; 1080p 59.8 fps, 16.73 ms mean, 20.82 ms worst. Unchanged from stage
+2. Depth results 22.5 and 22.3 a second.
+
+The user's review, live: the face "looks so much better", brightness changes
+smoothly as the light moves, the lines are "96% good" with some smaller
+artefacts left. Photo mode could not be judged against how it looked
+before. Asked for in passing, and the first item of stage 4: the light lit
+the room from the side but the source itself was nowhere to be seen. The
+user also found the PC laggy during and after the test; nothing of ours was
+running afterwards and CPU and GPU were idle when checked, cause not found.
+
 #### Expectation to set now
 
 Everything in phases A to C was judged against perfect synthetic depth with

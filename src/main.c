@@ -7,10 +7,12 @@
 #include "record.h"
 #include "relightshader.h"
 #include "analyse.h"
+#include "shadowpass.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -83,6 +85,9 @@ static RelightShader LoadRelightShader(void)
     r.shadowStepsLoc = GetShaderLocation(r.shader, "shadowSteps");
     r.shadowBiasLoc = GetShaderLocation(r.shader, "shadowBias");
     r.shadowThicknessLoc = GetShaderLocation(r.shader, "shadowThickness");
+    r.shadowSourceLoc = GetShaderLocation(r.shader, "shadowSource");
+    r.shadowTexLoc = GetShaderLocation(r.shader, "shadowTex");
+    r.terminatorWrapLoc = GetShaderLocation(r.shader, "terminatorWrap");
     return r;
 }
 
@@ -676,6 +681,14 @@ int main(int argc, char **argv)
         if (argc > 8) o.lag = atoi(argv[8]);
         if (argc > 9) o.extraDump[0] = atoi(argv[9]);
         if (argc > 10) o.extraDump[1] = atoi(argv[10]);
+        // Then any of: wrap=<value>, inline (march in the shader, unfiltered).
+        o.wrap = LIVE_TERMINATOR_WRAP;
+        o.filteredShadows = true;
+        for (int i = 11; i < argc; i++)
+        {
+            if (TextIsEqual(argv[i], "inline")) o.filteredShadows = false;
+            else if (strncmp(argv[i], "wrap=", 5) == 0) o.wrap = (float)atof(argv[i] + 5);
+        }
         int result = RunClipAnalysis(&rs, argv[2], argv[3], argv[4], o);
         UnloadShader(rs.shader);
         CloseWindow();
@@ -734,6 +747,7 @@ int main(int argc, char **argv)
     // applications, and nobody's camera list should change without asking.
     bool exposeAsCamera = false;
     RenderTexture2D cameraTarget = LoadRenderTexture(GetVirtualCameraWidth(), GetVirtualCameraHeight());
+    ShadowPass shadowPass = LoadShadowPass(16, 9);
     Image cameraFrame = GenImageColor(GetVirtualCameraWidth(), GetVirtualCameraHeight(), BLACK);
 
     bool webcamSystemReady = InitWebcamSystem();
@@ -1190,6 +1204,25 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.shadowStepsLoc, &activeShadowSteps, SHADER_UNIFORM_INT);
         SetShaderValue(rs.shader, rs.shadowBiasLoc, &shadowBias, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.shadowThicknessLoc, &shadowThickness, SHADER_UNIFORM_FLOAT);
+        // A soft terminator on the live subject, whose normals are close to
+        // flat; exact depth keeps true Lambert.
+        float terminatorWrap = liveDepthUsable ? LIVE_TERMINATOR_WRAP : 0.0f;
+        SetShaderValue(rs.shader, rs.terminatorWrapLoc, &terminatorWrap, SHADER_UNIFORM_FLOAT);
+
+        // Shadows are marched once, small, then blurred and averaged over
+        // time; the window and the virtual camera both read that result.
+        Texture2D maskTexture = (liveMask.id != 0) ? liveMask : noDepth;
+        Texture2D shadowTexture = noDepth;
+        int shadowSource = 0;
+        if ((activeGeometry == GEOMETRY_DEPTH) && (activeShadowSteps > 0))
+        {
+            shadowTexture = UpdateShadowPass(&shadowPass, &rs, albedoTexture, activeDepth,
+                                             maskTexture, GetFrameTime());
+            shadowSource = 1;
+            SetShaderValue(rs.shader, rs.viewModeLoc, &viewMode, SHADER_UNIFORM_INT);
+        }
+        else shadowPass.primed = false;
+        SetShaderValue(rs.shader, rs.shadowSourceLoc, &shadowSource, SHADER_UNIFORM_INT);
 
         // Render the relit image again, on its own, at the camera's resolution
         // and without any of the UI. Letterboxed so the source keeps its
@@ -1209,8 +1242,8 @@ int main(int argc, char **argv)
             // batch and rlDrawRenderBatch clears the registered auxiliary
             // texture units, so an earlier binding is silently discarded.
             SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
-            SetShaderValueTexture(rs.shader, rs.subjectMaskLoc,
-                                  (liveMask.id != 0) ? liveMask : noDepth);
+            SetShaderValueTexture(rs.shader, rs.subjectMaskLoc, maskTexture);
+            SetShaderValueTexture(rs.shader, rs.shadowTexLoc, shadowTexture);
             DrawTexturePro(albedoTexture, cameraSource, cameraQuad, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
             EndShaderMode();
             EndTextureMode();
@@ -1241,8 +1274,8 @@ int main(int argc, char **argv)
 
         BeginShaderMode(rs.shader);
         SetShaderValueTexture(rs.shader, rs.depthMapLoc, activeDepth);
-        SetShaderValueTexture(rs.shader, rs.subjectMaskLoc,
-                              (liveMask.id != 0) ? liveMask : noDepth);
+        SetShaderValueTexture(rs.shader, rs.subjectMaskLoc, maskTexture);
+        SetShaderValueTexture(rs.shader, rs.shadowTexLoc, shadowTexture);
         Rectangle albedoSource = { 0.0f, 0.0f, (float)albedoTexture.width, (float)albedoTexture.height };
         // Mirroring the live feed makes it behave like a mirror, which is what
         // you want when you are the subject.
@@ -1546,6 +1579,7 @@ int main(int argc, char **argv)
     StopVirtualCamera();
     UnloadRenderTexture(cameraTarget);
     UnloadImage(cameraFrame);
+    UnloadShadowPass(&shadowPass);
     if (webcamSystemReady) ShutdownWebcamSystem();
     UnloadShader(rs.shader);
     UnloadTexture(photoTexture);

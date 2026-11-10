@@ -33,6 +33,13 @@ typedef struct RelightShader {
     int shadowStepsLoc;
     int shadowBiasLoc;
     int shadowThicknessLoc;
+    int shadowSourceLoc;
+    int shadowTexLoc;
+    int terminatorWrapLoc;
 } RelightShader;
+
+// terminatorWrap for the live feed: how far past 90 degrees the light still
+// reaches the subject. See the diffuse term in lighting.fs.
+#define LIVE_TERMINATOR_WRAP 0.35f
 
 #endif
