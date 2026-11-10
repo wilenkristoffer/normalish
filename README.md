@@ -218,14 +218,15 @@ with nobody in frame it lights the office chair.
 
 ### Backlight
 
-![The bundled portrait: as shot, relit from behind, and relit from behind with the light drawn](docs/backlight.png)
+![The bundled portrait with the light carried once round the head](docs/backlight.gif)
 
-*Left: the bundled photo. Middle: lit from behind and to the left, as the
-shader did it before the light itself was drawn - the wall brightens, and
-nothing says where the light is. Right: the same light drawn, with the head
-in front of it, glow spilling over the outline and a rim along the hair.
+*The bundled photo with the light carried once round the head: behind it,
+where the head hides the disc and the glow spills over the outline with a
+rim along the hair, out to the side, over the top in front, and back.
 Rendered by replaying the photo as a clip (`--clip-from-image`, then
-`--analyse-clip`), which is the same path the live feed takes.*
+`--analyse-clip ... sweep`), which is the same path the live feed takes;
+the frames were joined into a GIF with ffmpeg, which the app itself does
+not use.*
 
 Push **Distance** past yourself and the light goes behind you. The light is
 drawn as a disc with a glow (**Source glow**, **Source size**), the person

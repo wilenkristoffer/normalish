@@ -717,7 +717,8 @@ int main(int argc, char **argv)
         if (argc > 9) o.extraDump[0] = atoi(argv[9]);
         if (argc > 10) o.extraDump[1] = atoi(argv[10]);
         // Then any of: wrap=<value>, inline (march in the shader, unfiltered),
-        // nosource (do not draw the light itself, its spill or the rim).
+        // nosource (do not draw the light itself, its spill or the rim),
+        // sweep (orbit the head with the light and write every frame).
         o.wrap = LIVE_TERMINATOR_WRAP;
         o.filteredShadows = true;
         o.drawSource = true;
@@ -726,6 +727,7 @@ int main(int argc, char **argv)
             if (TextIsEqual(argv[i], "inline")) o.filteredShadows = false;
             else if (strncmp(argv[i], "wrap=", 5) == 0) o.wrap = (float)atof(argv[i] + 5);
             else if (TextIsEqual(argv[i], "nosource")) o.drawSource = false;
+            else if (TextIsEqual(argv[i], "sweep")) o.sweep = true;
         }
         int result = RunClipAnalysis(&rs, argv[2], argv[3], argv[4], o);
         UnloadShader(rs.shader);

@@ -1276,9 +1276,23 @@ segmentation models, with a Backlight subsection, its limits and one
 picture. The picture is the bundled stock portrait, not footage of the
 user, who asked for that. The app only lights the photo in luminance mode,
 so `--clip-from-image` turns a picture into a clip and `--analyse-clip`
-replays it down the live path; the middle panel is that replay with the
-drawn light switched off (`nosource`), not the code as it was before the
-branch. `tools/get-person-models.ps1` is new: until now a fresh clone had no
+replays it down the live path.
+
+The picture was first a still in three panels (as shot, lit without the
+drawn light, lit with it); the user asked for the light moving round and
+behind the head instead, so it is now `docs/backlight.gif`. `sweep` on
+`--analyse-clip` carries the light once round the head over the clip and
+writes every lit frame; ffmpeg joins them (a tool on this machine, not a
+dependency). The orbit took three tries. A level circle put the light
+between the camera and the face on the near side, where the drawn disc
+simply hides the face, and through the head's own depth on the way, which
+leaves a hard-edged patch: the fault was the path, not the shader. The
+orbit is now tilted, over the top of the head in front and squarely behind
+it at the back. The forehead is still blown out for a few frames in front,
+and a short hard edge still shows on it as the light passes the head's
+depth; the loop starts on the backlit half. 48 frames, 360 px, 2.7 MB.
+
+`tools/get-person-models.ps1` is new: until now a fresh clone had no
 way to fetch the two person models and would have fallen back to the
 depth-band guess without saying why it looked worse.
 

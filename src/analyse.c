@@ -372,9 +372,26 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
             thickness = sceneNear*0.68f;
             bias = sceneNear*0.012f;
         }
+        float lightU = options.lightU, lightV = options.lightV;
+        if (options.sweep)
+        {
+            // One orbit of the head over the clip, so the last frame leads
+            // back into the first: across in front of the face, round the
+            // side, across behind the head and back. lightU and lightV are
+            // the centre of the orbit and zFactor its middle distance.
+            float a = 2.0f*PI*(float)f/(float)frames;
+            // A tilted orbit: wide enough that the light passes the head's
+            // own depth out to the side of it and not through it, and much
+            // higher in front than behind, so it goes over the top of the
+            // head on the near side (a light between the camera and the face
+            // just hides the face) and squarely behind it on the far side.
+            lightU = options.lightU - 0.42f*sinf(a);
+            lightV = options.lightV - 0.145f*cosf(a);
+            lightZ = knownNear*(options.zFactor - 0.35f*cosf(a));
+        }
         float lightPos[3] = {
-            (options.lightU*2.0f - 1.0f)*tanHalfFovX*lightZ,
-            (options.lightV*2.0f - 1.0f)*(tanHalfFovX/aspect)*lightZ,
+            (lightU*2.0f - 1.0f)*tanHalfFovX*lightZ,
+            (lightV*2.0f - 1.0f)*(tanHalfFovX/aspect)*lightZ,
             lightZ
         };
         float range[2] = { sceneNear, sceneFar };
@@ -610,7 +627,12 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
         // --- pictures, for a few frames ---
         bool dump = false;
         for (int k = 0; k < 6; k++) if (dumpAt[k] == f) dump = true;
-        if (dump)
+        if (options.sweep)
+        {
+            RenderView(rs, fullTarget, albedoTex, depthTex, maskTex, shadowTex, 0, 24);
+            ExportTarget(fullTarget, TextFormat("%s-sweep-%03d.png", outPrefix, f));
+        }
+        else if (dump)
         {
             RenderView(rs, fullTarget, albedoTex, depthTex, maskTex, shadowTex, 0, 24);
             ExportTarget(fullTarget, TextFormat("%s-f%03d-lit.png", outPrefix, f));

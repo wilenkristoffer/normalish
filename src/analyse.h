@@ -13,6 +13,8 @@ typedef struct AnalysisOptions {
     float wrap;             // terminatorWrap; 0 is the old hard terminator
     bool filteredShadows;   // false marches in the shader, as before the shadow pass
     bool drawSource;        // false leaves out the drawn light, its spill and the rim
+    bool sweep;             // carry the light once round the head over the clip,
+                            // and write the lit picture for every frame
 } AnalysisOptions;
 
 // Replays a recorded clip through the depth model and the relight shader and
