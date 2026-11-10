@@ -345,7 +345,13 @@ void main()
     float shadow = 1.0;
     if (geometryMode == 1)
     {
-        shadow = shadowFactor(P, L, dist);
+        // And only the subject receives them. A shadow thrown onto the room
+        // lands on a wall whose depth is a guess, from a silhouette whose
+        // thickness is a guess, and it showed: a dark halo around the person
+        // that crawled over the wall, curtains and furniture. In the room the
+        // march is skipped altogether, which also saves its cost there.
+        float receives = (maskEnabled == 1) ? subject : 1.0;
+        if (receives > 0.004) shadow = mix(1.0, shadowFactor(P, L, dist), receives);
         diffuse *= shadow;
         specular *= shadow;
     }

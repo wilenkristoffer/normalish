@@ -65,7 +65,7 @@ set(ORT_INCLUDE_DIR ${onnxruntime_SOURCE_DIR}/build/native/include)
 set(ORT_RUNTIME_DIR ${onnxruntime_SOURCE_DIR}/runtimes/win-x64/native)
 
 add_executable(normalish src/main.c src/webcam.c src/vcamhost.c src/depth.c src/depthmodel.c
-    src/clip.c src/record.c src/analyse.c src/segmodel.c)
+    src/clip.c src/record.c src/analyse.c src/segmodel.c src/personmask.c)
 # Media Foundation supplies webcam capture; it ships with Windows. mf.lib is
 # needed for MFEnumDeviceSources specifically, which is not in mfplat.lib.
 target_include_directories(normalish PRIVATE ${ORT_INCLUDE_DIR})

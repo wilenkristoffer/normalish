@@ -3,6 +3,7 @@
 #include "vcamhost.h"
 #include "depth.h"
 #include "depthmodel.h"
+#include "personmask.h"
 #include "record.h"
 #include "relightshader.h"
 #include "analyse.h"
@@ -675,11 +676,6 @@ int main(int argc, char **argv)
         if (argc > 8) o.lag = atoi(argv[8]);
         if (argc > 9) o.extraDump[0] = atoi(argv[9]);
         if (argc > 10) o.extraDump[1] = atoi(argv[10]);
-        // Optional: take the mask from a person segmentation model instead,
-        // "cpu" or "gpu" saying where to run it.
-        if (argc > 11) o.segPath = argv[11];
-        if (argc > 12) o.segOnGpu = TextIsEqual(argv[12], "gpu");
-        if (argc > 13) o.partsPath = argv[13];
         int result = RunClipAnalysis(&rs, argv[2], argv[3], argv[4], o);
         UnloadShader(rs.shader);
         CloseWindow();
@@ -945,7 +941,6 @@ int main(int argc, char **argv)
                 if ((freshW != liveDepthW) || (freshH != liveDepthH))
                 {
                     if (liveDepth.id != 0) UnloadTexture(liveDepth);
-    if (liveMask.id != 0) UnloadTexture(liveMask);
                     Image image = {
                         .data = (void *)fresh, .width = freshW, .height = freshH,
                         .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R32
@@ -1306,12 +1301,17 @@ int main(int argc, char **argv)
                 GuiCheckBox((Rectangle){ labelX, y, rowH, rowH }, "Subject only", &subjectOnly);
                 y += rowStep;
                 if (!subjectOnly) GuiSetState(STATE_DISABLED);
-                float beforeBand = subjectBand;
-                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Subject depth",
-                             TextFormat("%.2f %s", subjectBand, depthUnit),
-                             &subjectBand, 0.2f, 3.0f);
-                if (subjectBand != beforeBand) SetSubjectBand(subjectBand);
-                y += rowStep;
+                // The depth band only steers the fallback guess; with the person
+                // models loaded there is nothing for it to adjust.
+                if (!IsPersonMaskReady())
+                {
+                    float beforeBand = subjectBand;
+                    GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Subject depth",
+                                 TextFormat("%.2f %s", subjectBand, depthUnit),
+                                 &subjectBand, 0.2f, 3.0f);
+                    if (subjectBand != beforeBand) SetSubjectBand(subjectBand);
+                    y += rowStep;
+                }
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Room light",
                              TextFormat("%.2f", roomLight), &roomLight, 0.0f, 1.0f);
                 GuiSetState(STATE_NORMAL);
@@ -1551,6 +1551,7 @@ int main(int argc, char **argv)
     UnloadTexture(photoTexture);
     ShutdownDepthModel();
     if (liveDepth.id != 0) UnloadTexture(liveDepth);
+    if (liveMask.id != 0) UnloadTexture(liveMask);
     UnloadTexture(noDepth);
     UnloadSyntheticSource(&synthetic[0]);
     UnloadSyntheticSource(&synthetic[1]);

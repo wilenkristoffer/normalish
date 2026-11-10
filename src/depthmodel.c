@@ -1,4 +1,5 @@
 #include "depthmodel.h"
+#include "personmask.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -47,6 +48,9 @@ static unsigned char *maskBuffer = NULL;
 static unsigned char *maskScratch = NULL;
 static int *growStack = NULL;
 static int *labelBuffer = NULL;
+// The frame handed to the person models. Worker thread only.
+static unsigned char *personFrame = NULL;
+static int personFrameW = 0, personFrameH = 0;
 // Copies handed to the caller, so the worker can carry on without the render
 // thread reading a buffer part way through being rewritten.
 static float *publishDepth = NULL;
@@ -349,6 +353,41 @@ static void RunInference(const float *input, int cropX, int cropY, int cropW, in
     InterlockedExchange(&lastInferenceMicros,
                         (LONG)((t1.QuadPart - t0.QuadPart)*1000000/freq.QuadPart));
 
+    // The person models want the picture itself, and the only copy this thread
+    // has is the network input: the frame already shrunk to 518 wide, with
+    // the ImageNet normalisation applied. Undoing that is cheaper than
+    // carrying a second copy of every frame across threads, and 518 wide is
+    // twice what those models look at anyway. Done before taking the lock:
+    // it is several milliseconds the render thread should not wait for.
+    bool personRan = false;
+    if (IsPersonMaskReady())
+    {
+        if ((personFrame == NULL) || (personFrameW != cropW) || (personFrameH != cropH))
+        {
+            free(personFrame);
+            personFrame = (unsigned char *)malloc((size_t)cropW*cropH*4);
+            personFrameW = cropW; personFrameH = cropH;
+        }
+        if (personFrame != NULL)
+        {
+            for (int y = 0; y < cropH; y++)
+            {
+                for (int x = 0; x < cropW; x++)
+                {
+                    size_t at = (size_t)(y + cropY)*SIDE + (x + cropX);
+                    unsigned char *p = personFrame + ((size_t)y*cropW + x)*4;
+                    for (int c = 0; c < 3; c++)
+                    {
+                        float v = (input[(size_t)c*SIDE*SIDE + at]*kStd[c] + kMean[c])*255.0f;
+                        p[c] = (unsigned char)((v < 0.0f) ? 0.0f : ((v > 255.0f) ? 255.0f : v + 0.5f));
+                    }
+                    p[3] = 255;
+                }
+            }
+            personRan = RunPersonModels(personFrame, cropW, cropH);
+        }
+    }
+
     float *raw = NULL;
     if (!Failed(ort->GetTensorMutableData(outputTensor, (void **)&raw), "data"))
     {
@@ -361,7 +400,6 @@ static void RunInference(const float *input, int cropX, int cropY, int cropW, in
             free(maskBuffer); maskBuffer = NULL;
             free(maskScratch); maskScratch = NULL;
             free(growStack); growStack = NULL;
-    free(labelBuffer); labelBuffer = NULL;
             free(labelBuffer); labelBuffer = NULL;
             free(publishDepth); publishDepth = NULL;
             free(publishMask); publishMask = NULL;
@@ -443,7 +481,16 @@ static void RunInference(const float *input, int cropX, int cropY, int cropW, in
                 resultFar = lo + span*(float)highBin/(float)(BINS - 1);
             }
 
-            ComputeSubjectMask(cropW, cropH, subjectBand);
+            // Who the subject is: from the person models when they are there,
+            // against this frame's own depth rather than the smoothed one so
+            // a moving hand is tested where it is now. Without the models,
+            // the older guess from depth alone.
+            if (personRan)
+            {
+                if (maskBuffer == NULL) maskBuffer = (unsigned char *)malloc(count);
+                if (maskBuffer != NULL) BuildPersonMask(resultDepth, cropW, cropH, maskBuffer);
+            }
+            else ComputeSubjectMask(cropW, cropH, subjectBand);
 
             resultFresh = true;
         }
@@ -538,6 +585,10 @@ bool InitDepthModel(void)
     frameReady = CreateEventW(NULL, FALSE, FALSE, NULL);
     workerThread = CreateThread(NULL, 0, WorkerMain, NULL, 0, NULL);
     if ((frameReady == NULL) || (workerThread == NULL)) { SetStatus("thread failed"); return false; }
+
+    // Not fatal either: without the person models the subject is guessed from
+    // depth alone, as before. Loaded before the worker starts using them.
+    InitPersonMask();
 
     SetStatus(onGpu ? "ready (DirectML)" : "ready (CPU - slow)");
     ready = true;
@@ -702,6 +753,8 @@ void ShutdownDepthModel(void)
         workerThread = NULL;
     }
     if (frameReady != NULL) { CloseHandle(frameReady); frameReady = NULL; }
+    ShutdownPersonMask();
+    free(personFrame); personFrame = NULL;
 
     if (ort != NULL)
     {
@@ -717,6 +770,7 @@ void ShutdownDepthModel(void)
     free(maskBuffer); maskBuffer = NULL;
     free(maskScratch); maskScratch = NULL;
     free(growStack); growStack = NULL;
+    free(labelBuffer); labelBuffer = NULL;
     free(publishDepth); publishDepth = NULL;
     free(publishMask); publishMask = NULL;
     ready = false;

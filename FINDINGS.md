@@ -277,6 +277,22 @@ and likewise for streams.
   is"** when clothes and furniture are equally dark, and wrong once the
   person has moved the furniture. Trust its trends, not its absolutes, and
   look at the frames.
+- **Run the segmentation models before taking the lock, and feed them the
+  picture the depth network already has.** The worker undoes the ImageNet
+  normalisation on the 518x291 crop instead of keeping a second copy of the
+  camera frame, so mask and depth come from exactly the same frame. Only the
+  cheap combining step runs under the lock the render thread waits on.
+- **Gate the mask with this frame's raw depth, not the smoothed depth.** The
+  smoothed map trails a moving arm, and the "not far behind the person" test
+  then cuts the arm off.
+- **A fixed temporal average is wrong for a mask.** It trails a moving arm
+  with a ghost. No average lets a one-pixel wobble at the silhouette crawl.
+  Scale the blend by the size of the change: small changes are averaged
+  (0.3), a pixel that flips completely follows at once. Remaining flaw: the
+  soft rim of a region that vanishes fades over about five results, a faint
+  outline in the mask view that was not visible in the lit picture.
+- **Hold the last mask for two results when nobody is found.** A single
+  missed frame otherwise blinks the whole relight off.
 
 ## Build
 

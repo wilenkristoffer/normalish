@@ -19,7 +19,7 @@
 #include "raylib.h"
 #include "clip.h"
 #include "depthmodel.h"
-#include "segmodel.h"
+#include "personmask.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -51,108 +51,10 @@ static const char *kColumnNames[COL_COUNT] = {
     "roomFracPct", "subjFracPct", "segMs"
 };
 
-// Bilinear resize of an 8-bit single-channel image.
-static void ResizeMask(const unsigned char *src, int sw, int sh, unsigned char *dst, int dw, int dh)
-{
-    for (int y = 0; y < dh; y++)
-    {
-        float fy = ((float)y + 0.5f)*(float)sh/(float)dh - 0.5f;
-        if (fy < 0.0f) fy = 0.0f;
-        int y0 = (int)fy, y1 = (y0 + 1 < sh) ? y0 + 1 : sh - 1;
-        float ty = fy - (float)y0;
-        for (int x = 0; x < dw; x++)
-        {
-            float fx = ((float)x + 0.5f)*(float)sw/(float)dw - 0.5f;
-            if (fx < 0.0f) fx = 0.0f;
-            int x0 = (int)fx, x1 = (x0 + 1 < sw) ? x0 + 1 : sw - 1;
-            float tx = fx - (float)x0;
-            float top = src[(size_t)y0*sw + x0]*(1.0f - tx) + src[(size_t)y0*sw + x1]*tx;
-            float bottom = src[(size_t)y1*sw + x0]*(1.0f - tx) + src[(size_t)y1*sw + x1]*tx;
-            dst[(size_t)y*dw + x] = (unsigned char)(top*(1.0f - ty) + bottom*ty + 0.5f);
-        }
-    }
-}
-
 static int CompareFloats(const void *a, const void *b)
 {
     float x = *(const float *)a, y = *(const float *)b;
     return (x > y) - (x < y);
-}
-
-// Two segmentation models and the depth map, each covering for what the
-// others get wrong:
-//   parts  is sure about heads, skin and hands and does not take furniture for
-//          a person, but barely marks dark clothing;
-//   body   marks the whole torso, but misses a raised hand and sometimes marks
-//          an empty chair or a bright window;
-//   depth  knows nothing about people but does know how far away things are.
-// The person is everything either model marks that is joined to something
-// "parts" is sure of and is not far behind it. Written into body, in place.
-static void CombinePersonMasks(unsigned char *body, const unsigned char *parts,
-                               const float *depth, int w, int h, int *queue)
-{
-    size_t n = (size_t)w*h;
-    const unsigned char sure = 160, maybe = 96;
-    const float behind = 1.4f;   // how much further than the core still counts
-
-    // How far away the sure pixels are: their median, by a coarse histogram
-    // over the depth range present.
-    float lo = 1.0e30f, hi = -1.0e30f;
-    size_t sureCount = 0;
-    for (size_t i = 0; i < n; i++)
-    {
-        if (parts[i] < sure) continue;
-        if (depth[i] < lo) lo = depth[i];
-        if (depth[i] > hi) hi = depth[i];
-        sureCount++;
-    }
-    // Too little to call a person: a few stray pixels must not light up the
-    // room. 0.15% of the picture is a hand at arm's length.
-    if (sureCount < n*15/10000)
-    {
-        memset(body, 0, n);
-        return;
-    }
-    int bins[64] = { 0 };
-    float span = (hi > lo) ? (hi - lo) : 1.0f;
-    for (size_t i = 0; i < n; i++)
-    {
-        if (parts[i] < sure) continue;
-        int b = (int)((depth[i] - lo)/span*63.0f);
-        bins[b]++;
-    }
-    size_t seen = 0;
-    float coreDepth = hi;
-    for (int b = 0; b < 64; b++)
-    {
-        seen += (size_t)bins[b];
-        if (seen*2 >= sureCount) { coreDepth = lo + ((float)b + 0.5f)/63.0f*span; break; }
-    }
-    float limit = coreDepth*behind;
-
-    // Candidates: marked by either model and not too far back. Reuse body as
-    // the working image: 0 = no, 1 = candidate, then 2 = reached.
-    for (size_t i = 0; i < n; i++)
-    {
-        unsigned char v = (body[i] > parts[i]) ? body[i] : parts[i];
-        body[i] = ((v >= maybe) && (depth[i] <= limit)) ? 1 : 0;
-    }
-
-    int head = 0, tail = 0;
-    for (size_t i = 0; i < n; i++)
-    {
-        if ((parts[i] >= sure) && (body[i] == 1)) { body[i] = 2; queue[tail++] = (int)i; }
-    }
-    while (head < tail)
-    {
-        int i = queue[head++];
-        int x = i % w, y = i / w;
-        if ((x > 0) && (body[i - 1] == 1)) { body[i - 1] = 2; queue[tail++] = i - 1; }
-        if ((x < w - 1) && (body[i + 1] == 1)) { body[i + 1] = 2; queue[tail++] = i + 1; }
-        if ((y > 0) && (body[i - w] == 1)) { body[i - w] = 2; queue[tail++] = i - w; }
-        if ((y < h - 1) && (body[i + w] == 1)) { body[i + w] = 2; queue[tail++] = i + w; }
-    }
-    for (size_t i = 0; i < n; i++) body[i] = (body[i] == 2) ? 255 : 0;
 }
 
 // Sorts in place. fraction 0.5 is the median.
@@ -303,23 +205,6 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
     Clip clip = { 0 };
     if (!OpenClip(&clip, clipPath)) { printf("ANALYSE: could not open %s\n", clipPath); return 1; }
     if (!InitDepthModel()) { printf("ANALYSE: %s\n", GetDepthModelStatus()); return 1; }
-    bool useSeg = (options.segPath != NULL);
-    bool useParts = useSeg && (options.partsPath != NULL);
-    SegModel *segModel = NULL, *partsModel = NULL;
-    if (useSeg)
-    {
-        segModel = LoadSegModel(options.segPath, options.segOnGpu);
-        printf("ANALYSE: segmentation %s\n", GetSegModelStatus(segModel));
-        if (!SegModelReady(segModel)) return 1;
-    }
-    if (useParts)
-    {
-        partsModel = LoadSegModel(options.partsPath, true);
-        printf("ANALYSE: parts segmentation %s\n", GetSegModelStatus(partsModel));
-        if (!SegModelReady(partsModel)) return 1;
-    }
-    unsigned char *segMask = NULL, *partsMask = NULL;
-    int *fillQueue = NULL;
 
     int w = clip.width, h = clip.height, frames = clip.frameCount;
     int aw = ANALYSIS_WIDTH, ah = ANALYSIS_WIDTH*h/w;
@@ -441,39 +326,7 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
             int nw = 0, nh = 0;
             if (!WaitForDepth(&depth, &mask, &nw, &nh)) { printf("ANALYSE: no depth at frame %d\n", f); return 1; }
             fresh = true;
-            if (useSeg)
-            {
-                // The person mask replaces the depth model's, resampled to the
-                // depth map's size so everything downstream is unchanged.
-                const unsigned char *raw = NULL;
-                int sw = 0, sh = 0;
-                if (!RunSegModel(segModel, rgbaDepth, w, h, &raw, &sw, &sh))
-                {
-                    printf("ANALYSE: segmentation failed: %s\n", GetSegModelStatus(segModel));
-                    return 1;
-                }
-                if ((nw != dw) || (nh != dh))
-                {
-                    free(segMask); free(partsMask); free(fillQueue);
-                    segMask = (unsigned char *)malloc((size_t)nw*nh);
-                    partsMask = (unsigned char *)malloc((size_t)nw*nh);
-                    fillQueue = (int *)malloc((size_t)nw*nh*sizeof(int));
-                }
-                ResizeMask(raw, sw, sh, segMask, nw, nh);
-                mask = segMask;
-                row[COL_SEG_MS] = GetSegInferenceMs(segModel);
-                if (useParts)
-                {
-                    if (!RunSegModel(partsModel, rgbaDepth, w, h, &raw, &sw, &sh))
-                    {
-                        printf("ANALYSE: parts segmentation failed: %s\n", GetSegModelStatus(partsModel));
-                        return 1;
-                    }
-                    ResizeMask(raw, sw, sh, partsMask, nw, nh);
-                    row[COL_SEG_MS] += GetSegInferenceMs(partsModel);
-                    CombinePersonMasks(segMask, partsMask, depth, nw, nh, fillQueue);
-                }
-            }
+            row[COL_SEG_MS] = GetPersonMaskMs();
             if ((nw != dw) || (nh != dh))
             {
                 dw = nw; dh = nh;
@@ -824,9 +677,6 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
     if (maskTex.id != 0) UnloadTexture(maskTex);
     CloseClip(&clip);
     ShutdownDepthModel();
-    UnloadSegModel(segModel);
-    UnloadSegModel(partsModel);
-    free(segMask); free(partsMask); free(fillQueue);
 
     free(rgba); free(rgbaDepth); free(small); free(background);
     free(yIn); free(yOut); free(yNoShadow); free(shade);

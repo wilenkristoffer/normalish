@@ -10,11 +10,6 @@ typedef struct AnalysisOptions {
     float zFactor;          // light distance as a multiple of the scene's near
     int lag;                // frames the depth trails the picture by; 0 = none
     int extraDump[2];       // further frames to write pictures for, -1 = none
-    const char *segPath;    // person segmentation model to take the mask from,
-                            // or NULL to use the depth model's own mask
-    bool segOnGpu;          // run that model on DirectML rather than the CPU
-    const char *partsPath;  // a second model that is sure about heads and hands;
-                            // given both, the two masks are combined
 } AnalysisOptions;
 
 // Replays a recorded clip through the depth model and the relight shader and

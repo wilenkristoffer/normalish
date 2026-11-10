@@ -1054,7 +1054,7 @@ the live app. Shader view mode 5 shows the shadow term alone.
 59.3 fps, 16.87 ms mean, 22.49 ms worst; 1080p 57.6 fps, 17.39 ms mean,
 27.51 ms worst. Depth 25.5 and 23.9 results a second.
 
-**Stage 2 - isolate the person (in progress).** The decision is to take
+**Stage 2 - isolate the person (done 2026-11-10).** The decision is to take
 "who is the person" from a segmentation model and keep depth for "how far".
 Three MediaPipe selfie models were measured on the clips (all Apache 2.0;
 details in FINDINGS.md). None is good enough alone:
@@ -1081,9 +1081,53 @@ temporal smoothing yet, measured on all six clips:
 | empty | 1.000 | - | nothing marked in any frame |
 
 Cost about 6 ms per depth result, on the depth worker thread, not the render
-thread. Still to do: user's go-ahead on two models, move it into the live
-pipeline with temporal smoothing and a soft edge, make the person the only
-shadow receiver, then measure frame time live and review with the user.
+thread.
+
+The user agreed to both models. The combination now lives in
+`src/personmask.c` and runs in the depth worker: models before the lock, on
+the picture the depth network was given; combining under the lock, against
+that frame's raw depth. Steadying is a two-result hold when nobody is found
+and a temporal average that only applies to small changes. The shader gives
+shadows to the person only (`receives` in `lighting.fs`). The depth-band
+mask stays as the fallback when the models are missing, and the "Subject
+depth" slider is only shown then. The prototype in `analyse.c` is gone;
+`--analyse-clip` measures the live path.
+
+Same six clips, before (depth-band mask, shadows everywhere) and after:
+
+| clip | mask IoU (mean) | room pixels shadowed (mean) | room shadow flicker (p95) | person shadow flicker (p95) |
+|---|---|---|---|---|
+| still | 0.883 -> 0.997 | 5.4% -> 0.16% | 10.9 -> 0.02 | 39 -> 5.8 |
+| head | 0.890 -> 0.990 | 8.5% -> 0.16% | | 68 -> 42 |
+| wave | 0.837 -> 0.956 | 9.8% (max 33.7) -> 0.14% (max 0.8) | | 103 -> 86 |
+| lean | 0.902 -> 0.989 | 55% -> 0.21% | | 248 -> 21 |
+| leave | 0.731 -> 0.877 | 1.3% -> 0.03% | | |
+| empty | nothing marked | 0 | | |
+
+Silhouette movement on the still clip: 43 px -> 0.22 px (p95). Models take
+5.2 to 5.8 ms per depth result.
+
+Looked at as a viewer: the wall, curtains, bed and chair are untouched in
+every dumped frame. What is not fixed:
+
+- The shadows on the person are still blotchy and still move (head and wave
+  rows above). That is the shadow march and the light position, stage 3.
+- Wave: the palm is found, the motion-blurred fingers are not (5.5% of the
+  person missed, p95 20%), and the palm renders as a dark patch.
+- Leave: a person standing with their back turned at the frame edge is not
+  found (58% missed) and is simply left unlit.
+- The remaining 0.1-0.2% of room pixels are the soft mask edge.
+
+Frame time live, after (20 s each): 720p 59.9 fps, 16.70 ms mean, 17.94 ms
+worst; 1080p 59.8 fps, 16.74 ms mean, 21.41 ms worst. The render thread is
+unaffected. Depth results fell from 25.5 and 23.9 a second to 22.1 and 21.5,
+which is the two models on the worker thread. One 720p run had a single
+1668 ms frame that two repeats did not reproduce; cause unknown.
+
+The user's review, live: the room looks better, the silhouette holds when
+moving and leaning, going unlit when turned away is acceptable. The
+half-covered waving hand "looks kinda bad" and is carried forward as an
+open problem.
 
 #### Expectation to set now
 
