@@ -3,6 +3,9 @@
 #include "vcamhost.h"
 #include "depth.h"
 #include "depthmodel.h"
+#include "record.h"
+#include "relightshader.h"
+#include "analyse.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -38,36 +41,6 @@ static float DriftValue(Drift d, float t)
 {
     return 0.62f*sinf(t*d.freqA + d.phaseA) + 0.38f*sinf(t*d.freqB + d.phaseB);
 }
-
-typedef struct RelightShader {
-    Shader shader;
-    int lightPosLoc;
-    int lightColorLoc;
-    int lightIntensityLoc;
-    int falloffLoc;
-    int ambientLoc;
-    int specularStrengthLoc;
-    int shininessLoc;
-    int aspectLoc;
-    int viewModeLoc;
-    int texelSizeLoc;
-    int reliefLoc;
-    int sampleSpacingLoc;
-    int geometryModeLoc;
-    int depthMapLoc;
-    int tanHalfFovXLoc;
-    int depthSpacingLoc;
-    int depthRangeLoc;
-    int distanceScaleLoc;
-    int depthTexelSizeLoc;
-    int depthReliefLoc;
-    int subjectMaskLoc;
-    int maskEnabledLoc;
-    int roomLightLoc;
-    int shadowStepsLoc;
-    int shadowBiasLoc;
-    int shadowThicknessLoc;
-} RelightShader;
 
 typedef struct LightSettings {
     Color color;
@@ -641,6 +614,7 @@ int main(int argc, char **argv)
     bool verifyOnly = (argc > 1) && (TextIsEqual(argv[1], "--verify-normals"));
     bool depthImageOnly = (argc > 3) && (TextIsEqual(argv[1], "--depth-image"));
     bool grabOnly = (argc > 2) && (TextIsEqual(argv[1], "--grab-frame"));
+    bool recordOnly = (argc > 2) && (TextIsEqual(argv[1], "--record-session"));
     const char *photoPath = ((argc > 1) && (argv[1][0] != '-')) ? argv[1]
                                                                 : ASSET_DIR "/portrait.png";
 
@@ -676,6 +650,41 @@ int main(int argc, char **argv)
     SetTextureFilter(photoTexture, TEXTURE_FILTER_BILINEAR);
 
     RelightShader rs = LoadRelightShader();
+
+    if (recordOnly)
+    {
+        // Optional third argument is the capture preset index, as for
+        // --grab-frame. 1080p unless told otherwise.
+        int mode = (argc > 3) ? atoi(argv[3]) : 2;
+        int presets = (int)(sizeof(captureWidths)/sizeof(captureWidths[0]));
+        if ((mode < 0) || (mode >= presets)) mode = 2;
+        int result = RunRecordSession(argv[2], captureWidths[mode], captureHeights[mode]);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return result;
+    }
+
+    if ((argc > 4) && TextIsEqual(argv[1], "--analyse-clip"))
+    {
+        // --analyse-clip <clip> <empty clip or -> <out prefix> [u v zFactor lag]
+        AnalysisOptions o = { .lightU = 0.5f, .lightV = 0.5f, .zFactor = 1.15f, .lag = 0,
+                              .extraDump = { -1, -1 } };
+        if (argc > 5) o.lightU = (float)atof(argv[5]);
+        if (argc > 6) o.lightV = (float)atof(argv[6]);
+        if (argc > 7) o.zFactor = (float)atof(argv[7]);
+        if (argc > 8) o.lag = atoi(argv[8]);
+        if (argc > 9) o.extraDump[0] = atoi(argv[9]);
+        if (argc > 10) o.extraDump[1] = atoi(argv[10]);
+        // Optional: take the mask from a person segmentation model instead,
+        // "cpu" or "gpu" saying where to run it.
+        if (argc > 11) o.segPath = argv[11];
+        if (argc > 12) o.segOnGpu = TextIsEqual(argv[12], "gpu");
+        if (argc > 13) o.partsPath = argv[13];
+        int result = RunClipAnalysis(&rs, argv[2], argv[3], argv[4], o);
+        UnloadShader(rs.shader);
+        CloseWindow();
+        return result;
+    }
 
     if (grabOnly)
     {
@@ -749,6 +758,14 @@ int main(int argc, char **argv)
     // 720p, not 480p: 640x480 is 4:3, and asking for it makes a 16:9 camera
     // hand back its one 4:3 mode, which then gets letterboxed downstream.
     int selectedMode = 1;          // index into captureWidths/captureHeights
+    // --perf-log <seconds> [capture mode]: run the live feed untouched for
+    // that long, then print what a frame cost and exit. Skips the first two
+    // seconds, which are the camera and the model warming up.
+    bool perfLog = (argc > 2) && TextIsEqual(argv[1], "--perf-log");
+    double perfSeconds = perfLog ? atof(argv[2]) : 0.0;
+    if (perfLog && (argc > 3)) selectedMode = atoi(argv[3]);
+    double perfStart = 0.0, perfFrameSum = 0.0, perfFrameMax = 0.0, perfInferSum = 0.0;
+    int perfFrames = 0, perfCamera = 0, perfDepth = 0, perfOver20 = 0;
     int openedDevice = -1;
     int openedMode = -1;
     bool deviceDropdownOpen = false;
@@ -829,7 +846,17 @@ int main(int argc, char **argv)
     // single value cannot mean the right thing in both. Falloff here is
     // relative to the scene's nearest surface, so it survives a change of
     // scene scale.
-    float depthFalloff = 2.0f;
+    // Falloff is expressed as a reach rather than a coefficient. In the flat
+    // model the Height slider set the light's distance to the single surface,
+    // so it doubled as a size control; in depth mode Distance became the
+    // light's depth position and size fell to the falloff coefficient, which
+    // runs backwards - larger meant smaller. Reach restores a knob where
+    // bigger means bigger.
+    //
+    // Held as a fraction of the scene's near plane so it survives the depth
+    // model's scale drifting. atten halves at d = scale/sqrt(falloff), so
+    // falloff = 1/reach^2 and a reach of 0.7 reproduces the old default of 2.
+    float depthReach = 0.7f;
     float depthLightDistance = 0.7f;
     float knownSceneNear = 0.0f;
 
@@ -869,8 +896,32 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_FOUR)) viewMode = 3;
         if (IsKeyPressed(KEY_FIVE)) viewMode = 4;
 
+        bool perfMeasuring = perfLog && (GetTime() > 2.0);
+        if (perfMeasuring)
+        {
+            if (perfFrames == 0) perfStart = GetTime();
+            double ms = GetFrameTime()*1000.0;
+            perfFrames++;
+            perfFrameSum += ms;
+            if (ms > perfFrameMax) perfFrameMax = ms;
+            if (ms > 20.0) perfOver20++;
+            if ((GetTime() - perfStart) >= perfSeconds)
+            {
+                double span = GetTime() - perfStart;
+                printf("PERF: capture %dx%d, %.1f s\n", webcamFrame.width, webcamFrame.height, span);
+                printf("PERF: render  %.1f fps, frame mean %.2f ms, max %.2f ms, %d of %d frames over 20 ms\n",
+                       perfFrames/span, perfFrameSum/perfFrames, perfFrameMax, perfOver20, perfFrames);
+                printf("PERF: camera  %.1f new frames per second\n", perfCamera/span);
+                printf("PERF: depth   %.1f results per second, inference mean %.1f ms\n",
+                       perfDepth/span, (perfDepth > 0) ? perfInferSum/perfDepth : 0.0);
+                fflush(stdout);
+                break;
+            }
+        }
+
         if (webcamReady && UpdateWebcamFrame((unsigned char *)webcamFrame.data))
         {
+            if (perfMeasuring) perfCamera++;
             UpdateTexture(webcamTexture, webcamFrame.data);
             Vector2 found = { 0 };
             tracking = TrackBrightestPoint(webcamFrame, 4, &found);
@@ -890,6 +941,7 @@ int main(int argc, char **argv)
             int freshW = 0, freshH = 0;
             if (TakeLatestDepth(&fresh, &freshMask, &freshW, &freshH))
             {
+                if (perfMeasuring) { perfDepth++; perfInferSum += GetDepthInferenceMs(); }
                 if ((freshW != liveDepthW) || (freshH != liveDepthH))
                 {
                     if (liveDepth.id != 0) UnloadTexture(liveDepth);
@@ -1110,6 +1162,7 @@ int main(int argc, char **argv)
         SetShaderValue(rs.shader, rs.lightPosLoc, lightPos, SHADER_UNIFORM_VEC3);
         SetShaderValue(rs.shader, rs.lightColorLoc, lightColor, SHADER_UNIFORM_VEC3);
         SetShaderValue(rs.shader, rs.lightIntensityLoc, &light.intensity, SHADER_UNIFORM_FLOAT);
+        float depthFalloff = 1.0f/(depthReach*depthReach);
         float activeFalloff = (activeGeometry == GEOMETRY_DEPTH) ? depthFalloff : light.falloff;
         SetShaderValue(rs.shader, rs.falloffLoc, &activeFalloff, SHADER_UNIFORM_FLOAT);
         SetShaderValue(rs.shader, rs.ambientLoc, &light.ambient, SHADER_UNIFORM_FLOAT);
@@ -1306,9 +1359,18 @@ int main(int argc, char **argv)
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Intensity",
                      TextFormat("%.2f", light.intensity), &light.intensity, 0.0f, 6.0f);
         y += rowStep;
+        if (activeGeometry == GEOMETRY_DEPTH)
+        {
+            // Shown as the distance at which the light drops to half
+            // brightness, which is what the size of the pool actually is.
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Reach",
+                         TextFormat("%.2f %s", depthReach*sceneNear, depthUnit),
+                         &depthReach, 0.15f, 3.0f);
+        }
+        else
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Falloff",
                      TextFormat("%.1f", activeFalloff),
-                     (activeGeometry == GEOMETRY_DEPTH) ? &depthFalloff : &light.falloff, 0.0f, 30.0f);
+                     &light.falloff, 0.0f, 30.0f);
         y += rowStep;
         GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Ambient",
                      TextFormat("%.2f", light.ambient), &light.ambient, 0.0f, 1.0f);

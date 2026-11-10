@@ -995,6 +995,96 @@ several resolutions and every later analysis run against the same file, and
 per-region score printing behind `SetDepthModelVerbose` for working out why a
 frame chose what it did.
 
+#### D5 - make it good enough to publish (started 2026-11-10)
+
+The user's verdict on D4, which is the ground truth for this phase: the light
+cannot be seen, shadows land all over the room and flicker there, and even on
+the person they are blotchy and jump. Five stages, each stopping for review:
+diagnosis, isolate the person, better shadows on the person, a visible light
+behind the subject, write-up.
+
+**Tooling added first, so every change is judged on the same footage.**
+`--record-session <dir>` (driven by `tools/record-clips.ps1`) records raw
+camera frames to `.nclip` files; six clips were recorded at 1080p: empty
+room, sitting still, head turns, waving, leaning, leaving the frame. They are
+footage of the user and stay in the gitignored `recordings/`.
+`--analyse-clip` replays a clip through the depth model and the shader and
+measures where shadows fall, flicker beyond the camera's own noise, and mask
+stability, writing a CSV and pictures. `--perf-log <seconds> [mode]` measures
+the live app. Shader view mode 5 shows the shadow term alone.
+
+**Stage 1 - diagnosis (done).** Root causes, measured on the clips:
+
+1. *The light cannot be seen* because nothing draws it. There is no emitter
+   term in the shader. With the light behind the subject the near-flat
+   normals (relief 0.02) face the camera, so the person receives almost
+   nothing and becomes a silhouette with a 1-2 px rim; the room is lit by a
+   flat normal that does not depend on where the light is, so moving the
+   light changes the wall by a uniform ~25 levels. The only thing left that
+   moves is the shadow.
+2. *Shadows land everywhere* by design: every pixel is a shadow receiver.
+   Room pixels darkened by the subject's shadow: 4-5% of the room sitting
+   still, 8% turning the head, 7% waving (32% worst frame), 83% leaning,
+   because the light's distance follows the scene's near plane with a 1.6x
+   hysteresis and the person leans past it. The halo on the wall flickers
+   from the jittered penumbra plus depth jitter of 0.2-0.4% per frame.
+3. *Shadows on the person are bad* for three reasons. (a) The depth-band
+   subject detection picks the wrong thing for 1-4 frames at a time - the
+   curtain or the box on the desk: 17 of 194 frames sitting still, 6/191
+   head, 13/173 wave, 9/172 lean, 73/310 leaving; the face flashes by ~46
+   levels each time. In the empty room it picks the chair (score 0.94). (b)
+   The default light at 1.15x near sits at the depth of the face
+   (subject/near measured 1.17). (c) The screen-space march over near-flat
+   normals is unstable in itself (shadow-term flicker on the subject, p95
+   68-250 levels). Depth lagging the picture is *not* a main cause: one
+   frame of lag measured the same as none.
+
+**Corrections to earlier conclusions.**
+- D3/D4 treated depth-band region scoring as good enough with tuning. It is
+  not: the wrong-subject frames above are on a person sitting still. D4's
+  closing remark - that this needs a person model, not a better heuristic -
+  was right and is now acted on.
+- Inference is 23 ms live (25 depth results a second), not the 44 ms recorded
+  earlier; 44 ms was with the GPU shared with something else.
+- During this stage I reported that the camera delivers 21-24 fps at 1080p.
+  Wrong: that was the recorder's write rate. Live, the camera delivers 39
+  new frames a second at both 720p and 1080p.
+
+**Frame time before any change** (`--perf-log`, user at the camera): 720p
+59.3 fps, 16.87 ms mean, 22.49 ms worst; 1080p 57.6 fps, 17.39 ms mean,
+27.51 ms worst. Depth 25.5 and 23.9 results a second.
+
+**Stage 2 - isolate the person (in progress).** The decision is to take
+"who is the person" from a segmentation model and keep depth for "how far".
+Three MediaPipe selfie models were measured on the clips (all Apache 2.0;
+details in FINDINGS.md). None is good enough alone:
+
+| model | size | cost | good at | fails at |
+|---|---|---|---|---|
+| landscape 256x144 | 462 kB | 2 ms CPU | torso and shoulders in any clothing; 0 wrong-subject frames; nothing in the empty room | a hand raised away from the body; a patch of bright window; half-marks the empty chair |
+| square 256x256 | 462 kB | 4 ms CPU | leaving the frame | unstable on the wave |
+| multiclass 256x256 | 16.5 MB | 3.5 ms GPU (67 ms CPU) | head, hair, skin, hands; rejects the chair | dark clothing against a dark chair (mask 4.4% of frame against 12%) |
+
+Combining landscape and multiclass with the depth map covers each one's
+failure: the person is whatever either model marks, that is connected to
+pixels the multiclass model is sure of, and is no more than 1.4x further
+away than those. Prototype in `analyse.c` (`CombinePersonMasks`), no
+temporal smoothing yet, measured on all six clips:
+
+| clip | frame-to-frame mask IoU (mean) | person missed (mean) | notes |
+|---|---|---|---|
+| still | 0.996 | 0.004% | |
+| head | 0.991 | 0.02% | |
+| lean | 0.989 | 0.08% | |
+| wave | 0.959 | 7.3% (p95 27%) | palm found, motion-blurred fingers and the dark forearm are not |
+| leave | 0.918 | 60% | back turned in dark clothes at the frame edge is half found; bending close to the lens with no face is not found at all |
+| empty | 1.000 | - | nothing marked in any frame |
+
+Cost about 6 ms per depth result, on the depth worker thread, not the render
+thread. Still to do: user's go-ahead on two models, move it into the live
+pipeline with temporal smoothing and a soft edge, make the person the only
+shadow receiver, then measure frame time live and review with the user.
+
 #### Expectation to set now
 
 Everything in phases A to C was judged against perfect synthetic depth with

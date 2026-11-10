@@ -235,6 +235,48 @@ and likewise for streams.
   capture resolution does not improve depth.** Measured from 1080p to 4K: the
   depth map stays 518 wide, the mask changes by 0.1% of frame, and the depth
   gradient is 4% smoother. Worth doing only for output sharpness.
+- **Depth alone cannot say which thing is the person.** Scoring depth-band
+  regions picked the curtain or a box for 1 to 4 frames at a time on a person
+  sitting still (17 of 194 frames), and picked the chair in an empty room.
+  Every flip flashed the face by about 46 levels. Earlier notes here treated
+  this as tunable; it is not. Depth answers "how far", a segmentation model
+  answers "who".
+- **Depth trailing the picture by a frame is not what makes shadows jump.**
+  Replaying a waving clip with the depth one frame late measured the same as
+  with none. The causes were the mask flipping and the march itself.
+- **Measure the live rate live.** A recorder writing 1080p frames to disk
+  logged 21-24 fps and that was reported as the camera's rate. The camera
+  delivers 39 new frames a second; the disk was the limit. Likewise the 44 ms
+  inference recorded earlier was with the GPU shared; alone it is 23 ms.
+
+## Person segmentation
+
+- **MediaPipe's selfie models run fine under ONNX Runtime** from community
+  conversions, all Apache 2.0: landscape (256x144, 462 kB, 2 ms on two CPU
+  threads, no faster on the GPU), square (256x256, 462 kB, 4 ms CPU) and
+  multiclass (256x256, 16.5 MB, 3.5 ms on DirectML, 67 ms on the CPU). Input
+  is RGB scaled to 0..1 with no mean or deviation.
+- **Read the layout off the model.** The same network is published NCHW by
+  one converter and NHWC by another, and the multiclass output is six class
+  scores (background, hair, body skin, face skin, clothes, others), not one
+  person channel. Person = 1 - softmax(background).
+- **Each model fails differently, and none is enough alone.** Landscape is
+  solid on a torso in any clothing but drops a hand raised away from the
+  body and marks bright windows and half of an empty chair. Multiclass is
+  sure about heads and hands and never took furniture for a person, but
+  barely marks a dark top against a dark chair. Union of both, kept only
+  where connected to pixels multiclass is sure of and not far behind them in
+  depth, held up on five of six clips.
+- **Squash, do not letterbox, a 16:9 frame into the square multiclass
+  model.** Letterboxing recovered a little of the shoulders but produced a
+  large false region on a bed behind a waving hand.
+- **A person with no face in view is not found.** Back turned in dark
+  clothes at the frame edge, or bent close to the lens: both models give
+  little or nothing. The mask going empty is the graceful outcome.
+- **An empty-room difference image is a poor reference for "where the person
+  is"** when clothes and furniture are equally dark, and wrong once the
+  person has moved the furniture. Trust its trends, not its absolutes, and
+  look at the frames.
 
 ## Build
 

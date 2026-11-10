@@ -3,6 +3,10 @@
 build/
 out/
 
+# Recorded webcam clips used for offline testing. Several GB each, and they
+# are footage of a person: never committed.
+recordings/
+
 # Compiled artifacts, in case anyone configures a build in the source tree
 *.obj
 *.exe

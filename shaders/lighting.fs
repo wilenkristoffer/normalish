@@ -342,9 +342,10 @@ void main()
     // Only the depth model can cast shadows; the luminance model has no
     // geometry to march through. Ambient is deliberately left out of the
     // shadow term, since a shadowed surface still sees the room.
+    float shadow = 1.0;
     if (geometryMode == 1)
     {
-        float shadow = shadowFactor(P, L, dist);
+        shadow = shadowFactor(P, L, dist);
         diffuse *= shadow;
         specular *= shadow;
     }
@@ -364,6 +365,9 @@ void main()
         float subject = texture(subjectMask, fragTexCoord).r;
         color = mix(albedo*0.25, vec3(0.2, 1.0, 0.3), subject*0.75);
     }
+    // Diagnostic only, not offered in the app: the raw shadow term, so the clip
+    // analysis can measure where shadows fall separately from the lighting.
+    else if (viewMode == 5) color = vec3(shadow);
     else if (viewMode == 1) color = normal*0.5 + 0.5;
     else if (viewMode == 2) color = albedo;
     else if (viewMode == 3)
