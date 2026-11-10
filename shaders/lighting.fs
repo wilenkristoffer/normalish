@@ -58,6 +58,13 @@ uniform int shadowSource;       // 0 = march here, 1 = read shadowTex
 uniform sampler2D shadowTex;    // R: 1 lit, 0 shadowed, from the shadow pass
 uniform float terminatorWrap;   // how far past 90 degrees light reaches the subject
 
+// How the light itself is drawn, depth mode only:
+//   x  radius of the source, as a fraction of the scene's near distance
+//   y  brightness of the source and its glow, 0 = do not draw it
+//   z  how much of the glow spills over the person's outline, 0..1
+//   w  strength of the rim of light on the person's edge
+uniform vec4 sourceLook;
+
 uniform vec3 lightPos;   // luminance mode: x in 0..aspect, y in 0..1, z above
                          // surface. depth mode: metres in camera space.
 uniform vec3 lightColor;
@@ -424,6 +431,111 @@ void main()
     if ((geometryMode == 1) && (maskEnabled == 1))
     {
         color = mix(albedo, color, mix(roomLight, 1.0, subject));
+    }
+
+    // --- the light itself ---------------------------------------------------
+    //
+    // Everything above lights surfaces, and a light with no surface near it
+    // was invisible: off to the side or behind the person there was nothing
+    // to say where it was. So the source is drawn too: a bright disc, a glow
+    // around it, the person in front of it, and the two things a backlight
+    // does to a silhouette - glow spilling over the outline, and a rim of
+    // light along the edge.
+    if ((geometryMode == 1) && (viewMode == 0) && (lightPos.z > 0.0001) &&
+        ((sourceLook.y > 0.0) || (sourceLook.w > 0.0)))
+    {
+        // Where the light is in the picture, and how far this pixel is from
+        // it, in picture heights so the disc is round.
+        vec2 lightUv = projectToUv(lightPos);
+        vec2 q = (fragTexCoord - lightUv)*vec2(aspect, 1.0);
+        float d = length(q);
+
+        // A source of fixed physical size, so pushing the light away makes it
+        // a small sun and pulling it close makes it a large lamp.
+        float tanHalfFovY = tanHalfFovX/aspect;
+        float r = clamp(sourceLook.x*distanceScale/(2.0*tanHalfFovY*lightPos.z), 0.004, 0.3);
+        float core = 1.0 - smoothstep(r*0.6, r, d);
+        // Two glows: a tight one that follows the disc's size, and a wide faint
+        // one whose reach is capped, or a large near source washes out the
+        // whole picture.
+        float tight = r*2.5;
+        float wide = min(r*7.0, 0.3);
+        float glow = 0.4*exp(-d*d/(2.0*tight*tight)) + 0.12*exp(-d*d/(2.0*wide*wide));
+
+        // Is the person in front of the light here? Only the person hides it:
+        // the room's depth is not good enough to say whether a light is in
+        // front of a curtain or behind it, and a source that winked out
+        // against the furniture would be the old problem again. The test is
+        // a ramp around the light's depth, so depth noise fades rather than
+        // flips it.
+        float person = (maskEnabled == 1) ? subject : 1.0;
+        float z = depthAt(fragTexCoord);
+        float band = 0.05*distanceScale;
+        float lightBehind = (z > 0.0) ? smoothstep(-band, band, lightPos.z - z) : 0.0;
+        float hidden = person*lightBehind;
+
+        // How close this pixel is to the person's outline, from the inside,
+        // and which way is out. Sixteen taps of the mask on two rings: their
+        // mean is 1 deep inside and about a half on the outline, and their
+        // weighted sum points inward. The mask is used, not the normals,
+        // because the outline is the steadiest thing we have.
+        float edge = 0.0;
+        float edgeThin = 0.0;
+        vec2 outward = vec2(0.0);
+        if ((maskEnabled == 1) && (subject > 0.02))
+        {
+            // The rings reach much further than the rim is wide: a pixel just
+            // inside the outline has only a few taps outside it, so the mean
+            // falls slowly, and with rings the width of the rim the rim came
+            // out a third as wide as intended and lost in the soft edge.
+            const float rimWidth = 0.03;    // picture heights
+            vec2 w = vec2(rimWidth/aspect, rimWidth);
+            float sum = 0.0;
+            float sumNear = 0.0;
+            vec2 inward = vec2(0.0);
+            for (int i = 0; i < 8; i++)
+            {
+                float a = float(i)*0.7853982;
+                vec2 dir = vec2(cos(a), sin(a));
+                float far = texture(subjectMask, fragTexCoord + dir*w).r;
+                float near = texture(subjectMask, fragTexCoord + dir*w*0.3).r;
+                sum += far + near;
+                sumNear += near;
+                inward += dir*(far + near);
+            }
+            // Two widths from the same taps. The wide one is for the glow
+            // spilling over the outline, which is soft. The thin one, from the
+            // inner ring alone, is for the rim: a rim as wide as the spill was
+            // a grey band around the person, and it is a line of light.
+            edge = subject*smoothstep(0.0, 0.35, 1.0 - sum/16.0);
+            edgeThin = subject*smoothstep(0.0, 0.4, 1.0 - sumNear/8.0);
+            outward = -inward;
+        }
+
+        float power = clamp(lightIntensity*0.5, 0.0, 1.5);
+
+        // The disc is hidden behind the person; the glow is hidden too,
+        // except along the outline, where it spills over.
+        float coreSeen = core*(1.0 - hidden);
+        float glowSeen = glow*(1.0 - hidden*(1.0 - sourceLook.z*edge));
+        color += (mix(lightColor, vec3(1.0), 0.5)*coreSeen*2.0 + lightColor*glowSeen)*sourceLook.y*power;
+
+        // The rim: the outline lit from behind. It is added after the shadow
+        // term, so a shadow cannot eat it.
+        //
+        // What decides its strength is how near the outline is to the light
+        // in the picture, not which way the outline faces. A light straight
+        // behind the head has every part of the outline facing away from it
+        // in the picture, and that is exactly when the rim should run all the
+        // way round; so facing the light only adds to it. Nearness falls off
+        // fast, or the rim becomes an even grey line around the whole person
+        // and the chair, which reads as a cut-out, not as light.
+        float toward = 0.0;
+        if ((dot(outward, outward) > 1.0e-6) && (d > 1.0e-4))
+            toward = max(dot(normalize(outward), -q/d), 0.0);
+        float nearness = 1.0/(1.0 + (d/0.22)*(d/0.22));
+        float rim = sourceLook.w*edgeThin*lightBehind*(0.55 + 0.45*toward)*nearness*power;
+        color += (albedo*2.0 + 0.4)*lightColor*rim*2.0;
     }
 
     if (viewMode == 4)

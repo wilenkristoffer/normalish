@@ -279,6 +279,23 @@ and likewise for streams.
   compile, and since shaders are loaded at run time from the source folder
   the build still succeeds. Check the log for `SHADER` errors after a shader
   edit.
+- **A light that only lights surfaces is invisible in empty space.** Draw
+  the source itself. Let only the person hide it: the room's depth is not
+  good enough to put a light in front of or behind the furniture.
+- **Build the rim from the mask's outline, not from the normals.** The
+  outline is the steadiest thing there is; sitting still the rim adds
+  nothing measurable to the flicker.
+- **A ring of mask taps gives an edge band much narrower than its radius.**
+  Just inside the outline only a few taps fall outside, so the mean barely
+  moves. Taps 13 px out gave a 10 px band lost in the mask's soft fringe.
+- **Rim strength follows nearness to the light in the picture, not which way
+  the outline faces.** With the light straight behind the head the whole
+  outline faces away from it, and that is when the rim should go all the
+  way round. An even rim everywhere reads as a cut-out, not as light.
+- **Spill is wide and soft, the rim is thin.** One band for both gave a grey
+  halo. Two rings of the same taps give both widths.
+- **Cap the wide glow's reach.** Scaled with a near light's disc it washed
+  out the whole picture.
 
 ## Person segmentation
 

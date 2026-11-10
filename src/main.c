@@ -88,6 +88,7 @@ static RelightShader LoadRelightShader(void)
     r.shadowSourceLoc = GetShaderLocation(r.shader, "shadowSource");
     r.shadowTexLoc = GetShaderLocation(r.shader, "shadowTex");
     r.terminatorWrapLoc = GetShaderLocation(r.shader, "terminatorWrap");
+    r.sourceLookLoc = GetShaderLocation(r.shader, "sourceLook");
     return r;
 }
 
@@ -625,7 +626,7 @@ int main(int argc, char **argv)
                                                                 : ASSET_DIR "/portrait.png";
 
     const float baseWidth = 1240.0f;
-    const float baseHeight = 860.0f;
+    const float baseHeight = 960.0f;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow((int)baseWidth, (int)baseHeight, "normalish");
@@ -681,13 +682,16 @@ int main(int argc, char **argv)
         if (argc > 8) o.lag = atoi(argv[8]);
         if (argc > 9) o.extraDump[0] = atoi(argv[9]);
         if (argc > 10) o.extraDump[1] = atoi(argv[10]);
-        // Then any of: wrap=<value>, inline (march in the shader, unfiltered).
+        // Then any of: wrap=<value>, inline (march in the shader, unfiltered),
+        // nosource (do not draw the light itself, its spill or the rim).
         o.wrap = LIVE_TERMINATOR_WRAP;
         o.filteredShadows = true;
+        o.drawSource = true;
         for (int i = 11; i < argc; i++)
         {
             if (TextIsEqual(argv[i], "inline")) o.filteredShadows = false;
             else if (strncmp(argv[i], "wrap=", 5) == 0) o.wrap = (float)atof(argv[i] + 5);
+            else if (TextIsEqual(argv[i], "nosource")) o.drawSource = false;
         }
         int result = RunClipAnalysis(&rs, argv[2], argv[3], argv[4], o);
         UnloadShader(rs.shader);
@@ -842,6 +846,8 @@ int main(int argc, char **argv)
     // The light should be visible moving around the room, not only on the
     // subject - that was the whole charm of the flat model it replaced.
     float roomLight = 0.5f;
+    // The light source drawn into the picture, with its glow, spill and rim.
+    SourceLook sourceLook = DEFAULT_SOURCE_LOOK;
     float subjectBand = 0.9f;
     int liveDepthW = 0, liveDepthH = 0;
     bool haveLiveDepth = false;
@@ -1208,6 +1214,7 @@ int main(int argc, char **argv)
         // flat; exact depth keeps true Lambert.
         float terminatorWrap = liveDepthUsable ? LIVE_TERMINATOR_WRAP : 0.0f;
         SetShaderValue(rs.shader, rs.terminatorWrapLoc, &terminatorWrap, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(rs.shader, rs.sourceLookLoc, &sourceLook, SHADER_UNIFORM_VEC4);
 
         // Shadows are marched once, small, then blurred and averaged over
         // time; the window and the virtual camera both read that result.
@@ -1352,6 +1359,24 @@ int main(int argc, char **argv)
                 GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Camera FOV",
                              TextFormat("%.0f deg", cameraFovDegrees),
                              &cameraFovDegrees, 40.0f, 110.0f);
+                y += rowStep;
+            }
+            // The light as a thing you can see. Glow at zero hides the source;
+            // spill and rim only mean something where there is a person mask.
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Source glow",
+                         (sourceLook.glow < 0.01f) ? "off" : TextFormat("%.2f", sourceLook.glow),
+                         &sourceLook.glow, 0.0f, 2.0f);
+            y += rowStep;
+            GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Source size",
+                         TextFormat("%.2f", sourceLook.size), &sourceLook.size, 0.02f, 0.3f);
+            y += rowStep;
+            if (liveDepthUsable && subjectOnly)
+            {
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Spill",
+                             TextFormat("%.2f", sourceLook.spill), &sourceLook.spill, 0.0f, 1.0f);
+                y += rowStep;
+                GuiSliderBar((Rectangle){ sliderX, y, sliderW, rowH }, "Rim light",
+                             TextFormat("%.2f", sourceLook.rim), &sourceLook.rim, 0.0f, 2.0f);
                 y += rowStep;
             }
             float beforeRelief = depthRelief;

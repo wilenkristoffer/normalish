@@ -12,6 +12,7 @@ typedef struct AnalysisOptions {
     int extraDump[2];       // further frames to write pictures for, -1 = none
     float wrap;             // terminatorWrap; 0 is the old hard terminator
     bool filteredShadows;   // false marches in the shader, as before the shadow pass
+    bool drawSource;        // false leaves out the drawn light, its spill and the rim
 } AnalysisOptions;
 
 // Replays a recorded clip through the depth model and the relight shader and

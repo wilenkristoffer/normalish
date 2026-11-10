@@ -310,6 +310,9 @@ int RunClipAnalysis(const RelightShader *rs, const char *clipPath, const char *e
     SetShaderValue(rs->shader, rs->maskEnabledLoc, &maskOn, SHADER_UNIFORM_INT);
     SetShaderValue(rs->shader, rs->roomLightLoc, &roomLight, SHADER_UNIFORM_FLOAT);
     SetShaderValue(rs->shader, rs->terminatorWrapLoc, &options.wrap, SHADER_UNIFORM_FLOAT);
+    SourceLook look = DEFAULT_SOURCE_LOOK;
+    if (!options.drawSource) look.glow = look.rim = 0.0f;
+    SetShaderValue(rs->shader, rs->sourceLookLoc, &look, SHADER_UNIFORM_VEC4);
 
     int dumpAt[6] = { frames/6, frames/2, frames/2 + 1, frames*5/6,
                       options.extraDump[0], options.extraDump[1] };

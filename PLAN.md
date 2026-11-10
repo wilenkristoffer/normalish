@@ -1205,6 +1205,71 @@ the room from the side but the source itself was nowhere to be seen. The
 user also found the PC laggy during and after the test; nothing of ours was
 running afterwards and CPU and GPU were idle when checked, cause not found.
 
+**Stage 4 - a light you can see (done 2026-11-10).** Until now the shader
+only lit surfaces, so a light with nothing near it was invisible. The source
+is now drawn, all in one block at the end of `lighting.fs`, after the shadow
+term so a shadow cannot eat it:
+
+1. A bright disc and two glows (one tight, one wide and capped). The disc
+   has a fixed physical size, so it is a small sun far away and a large lamp
+   close up.
+2. The person hides it: mask times a ramp around the light's depth. The
+   room never hides it, because the room's depth cannot say whether a light
+   is in front of a curtain or behind it.
+3. Spill: the glow shows through along the person's outline.
+4. Rim: a thin line of light on the inside of the outline, from the mask's
+   edge and not from the normals, strongest where the outline is near the
+   light in the picture.
+5. Four sliders (Source glow, Source size, Spill, Rim light) and a taller
+   window to hold them.
+
+Two things were wrong on the way:
+
+- The first rim was invisible. The edge measure used taps 13 px out and
+  came out about 10 px wide, inside the mask's soft fringe.
+- The second was an even grey line around the person and the chair, like a
+  cut-out. It shared the spill's wide band, had a floor all the way round,
+  and leaned on the outline facing the light, which also meant a light
+  straight behind the head gave no rim at all. The rim now has its own thin
+  band and follows nearness to the light; facing it only adds.
+
+Person flicker in the output picture, without -> with the drawn light (mean,
+p95 in brackets), light partly behind the head unless noted:
+
+| clip | without -> with |
+|---|---|
+| still | 0.235 -> 0.239 |
+| still, light at the side | 0.526 -> 0.537 |
+| head | 0.47 (0.97) -> 0.57 (1.29) |
+| lean | 0.43 (0.94) -> 0.82 (1.50) |
+| wave | 3.59 (11.1) -> 4.72 (13.5) |
+
+The still and head rows are at the final defaults; lean and wave were
+measured before spill and rim were turned down and not rerun. Sitting still
+the source costs nothing. Moving in front of it raises the number; part of
+that is the head really covering and uncovering a bright disc and part is
+the mask's edge against a bright background, and the number cannot tell
+them apart.
+
+Frame time live, after (20 s each): 720p 60.0 fps, 16.69 ms mean, 17.77 ms
+worst; 1080p 59.8 fps, 16.73 ms mean, 22.98 ms worst, 4 of 1197 frames over
+20 ms. Means unchanged from stage 3; the 1080p worst frame was 20.82 then.
+Depth results 22.5 and 21.3 a second (22.3 at 1080p before). Measured with
+spill 0.6 and rim 1.0, before they were turned down.
+
+The user's review, live: the head blocks the light well enough, though some
+hair sticks out past the mask's edge; steady while moving; the source is
+always visible and acceptable in front too; the edge on top of the head
+glowed too much with the light behind it. Spill and rim defaults went from
+0.6 and 1.0 to 0.4 and 0.6 after that. Not seen by the user yet: those
+defaults, and the taller window (the colour picker overlapped the hint text
+and the frame counter at 860).
+
+Not fixed: hair outside the mask is not rimmed and not hidden behind; a
+backlit person is nearly black unless Ambient is raised; the light shows
+through the half-masked waving hand; with nobody found there is no spill
+or rim.
+
 #### Expectation to set now
 
 Everything in phases A to C was judged against perfect synthetic depth with
